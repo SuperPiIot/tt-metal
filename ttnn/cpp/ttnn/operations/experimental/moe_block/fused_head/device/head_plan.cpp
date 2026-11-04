@@ -67,8 +67,10 @@ int64_t region_of(const Regions& r, const std::string& k) {
     return 0;
 }
 
-// head_plan.cores_check: every per-core requirement past the matmul cores' arena; "" or why not.
-std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsPlan& rs, int64_t arena) {
+// head_plan.cores_check: every per-core requirement past the matmul cores' arena; "" or why not. The ports' buffers
+// (logits sub-blocks, routing exchange packets, x-gather staging) and the watcher's grow the arena up to cap, as the
+// program grows it (head_program: the arena is one size on every core).
+std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsPlan& rs, int64_t& arena, int64_t cap) {
     const uint32_t G = shape.G, L = shape.links, gy = shape.grid[1];
     const bool ring = shape.ring && G > 2;
     if (rs.P >= 256 || (G > 4 && rs.scatter != -2)) {
@@ -108,8 +110,8 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
     }
     const int64_t ns = ceil_div(nc, L);
     const int64_t pbuf = int64_t(G - 1) * ns * ET * 4096;
-    if (pbuf > arena) {
-        return "the ports' logits sub-blocks: " + kb0(pbuf) + " KB > the arena's " + kb0(arena) + " KB";
+    if (pbuf > cap) {
+        return "the ports' logits sub-blocks: " + kb0(pbuf) + " KB > the arena's " + kb0(cap) + " KB";
     }
     const uint32_t N = shape.N(), S = shape.S(), K = shape.K, EPC = shape.EPC(), A = shape.A;
     if (N * EPC > 1024 || S > 2048 || EPC > 64 || S % 32) {
@@ -145,15 +147,18 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
         return "routing exchange: a port forwards " + s(nf) + " packets > 64";
     }
     const int64_t pcap = routing_slot_bytes(S, K, EPC, M);
-    if (al64(pbuf) + int64_t(nx + nf) * pcap > arena) {
-        return "routing exchange: a port's buffers " + kb0(al64(pbuf) + int64_t(nx + nf) * pcap) + " KB (logits " +
-               kb0(pbuf) + " + " + s(nx) + " + " + s(nf) + " packets of " + fmt_fixed(pcap / 1024.0, 1) +
-               " KB) > the arena's " + kb0(arena) + " KB";
+    const int64_t xg = port_cb_bytes(lay.KB, shape.payload, kPortGroup);  // (the x-gather's staging, after them)
+    const int64_t port = al64(al64(pbuf) + int64_t(nx + nf) * pcap) + xg;
+    if (port > cap) {
+        return "routing exchange: a port's buffers " + kb0(port) + " KB (logits " + kb0(pbuf) + " + " + s(nx) + " + " +
+               s(nf) + " packets of " + fmt_fixed(pcap / 1024.0, 1) + " KB + x-gather staging " + kb0(xg) +
+               " KB) > the arena's " + kb0(cap) + " KB";
     }
-    if (2 * int64_t(ny) * pcap > arena) {
+    if (2 * int64_t(ny) * pcap > cap) {
         return "routing exchange: the watcher's Y buffers " + kb0(2 * int64_t(ny) * pcap) + " KB > the arena's " +
-               kb0(arena) + " KB";
+               kb0(cap) + " KB";
     }
+    arena = std::max({arena, al64(port), al64(2 * int64_t(ny) * pcap)});
     const int64_t plen = 26 + 5 * int64_t(M) + 3 * int64_t(N) + 3 * int64_t(nsend);
     const std::vector<std::pair<std::string, int64_t>> nargs = {
         {"BRISC", 1 + 10 + 3 + 2 * int64_t(nc) + plen},
@@ -380,8 +385,8 @@ HeadSized head_size(const HeadShape& shape, const HeadLayout& lay, int64_t cap) 
     if (need > cap) {
         return {std::nullopt, need, eng->sizes, "router cores' arena " + kb0(need) + " KB > " + kb0(cap) + " KB"};
     }
-    const int64_t arena = std::max(eng->arena_bytes, need);
-    std::string why = cores_check(shape, lay, *rs, arena);
+    int64_t arena = std::max(eng->arena_bytes, need);
+    std::string why = cores_check(shape, lay, *rs, arena, cap);
     if (!why.empty()) {
         return {std::nullopt, arena, eng->sizes, why};
     }

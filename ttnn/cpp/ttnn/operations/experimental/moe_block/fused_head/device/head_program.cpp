@@ -879,6 +879,13 @@ std::shared_ptr<const HeadModel> make_head_model(
     for (const auto& [_, v] : h.fwd) {
         nf = std::max(nf, u32(v.size()));
     }
+    // (the arena grows to the ports' logits partials + routing buffers, and to the watcher's Y buffers, up to its cap -
+    // head_plan's cores_check)
+    for (const int64_t need_ : {h.xbase_off + int64_t(h.nx + nf) * h.PCAP, 2 * int64_t(h.ny) * h.PCAP}) {
+        if (h.arena_bytes < need_ && need_ <= e.args.arena_max) {
+            h.arena_bytes = al64(need_);
+        }
+    }
     TT_FATAL(
         h.xbase_off + int64_t(h.nx + nf) * h.PCAP <= h.arena_bytes, "fused_head: ports: no L1 for the routing buffers");
     // the x-gather's packet staging (kXgCb): an arena region on the port cores, after their routing buffers (the
