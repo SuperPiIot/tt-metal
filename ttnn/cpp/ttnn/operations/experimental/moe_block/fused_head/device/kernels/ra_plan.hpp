@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ttnn/cpp/ttnn/operations/experimental/moe_block/fused_head/device/kernels/ra_accessors.hpp"
+#include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 namespace ra {
 
@@ -27,13 +28,14 @@ constexpr uint32_t O_ENT = O_HDR + N * HBP, O_RUN = O_ENT + al64(4 * ENT_CAP + 1
 constexpr uint32_t O_ET = O_RUN + al64(4 * N * M);
 constexpr uint32_t O_TIDX = O_ET + al64(2 * EPC * S), O_TAB = O_TIDX + al64(4 * INST_ROWS);
 constexpr uint32_t O_WANT = O_TAB + al64(8 * INST_ROWS), O_PIN = O_WANT + al64(128 * NOWN);
-constexpr uint32_t O_PLAN = O_PIN + M * 64, O_CNT = O_PLAN + 128, O_RGN = O_CNT + al64(4 * (EPC + 32));
+constexpr uint32_t O_PLAN = O_PIN + M * 64, O_CNT = O_PLAN + moe_block_plan_words::kPlanHeadBytes, O_RGN = O_CNT + al64(4 * (EPC + 32));
 constexpr uint32_t O_ROWS = O_RGN + al64(4 * (EPC + 32));
 constexpr uint32_t NOWND = (N + M - 1) / M;  // (destinations an instance owns the header totals of: d % M == q)
 constexpr uint32_t O_CX = O_ROWS + 64, O_PSUM = O_CX + N * BB, O_TOT = O_PSUM + NOWND * M * BB;
 constexpr uint32_t LMW = 1024;  // local-memory counters: per global expert, later per (my expert, token) if they fit
 static_assert(NG <= LMW, "local counters: NG up to 1024");
 static_assert(S <= 2048 && EPC <= 64, "an entry: token (11 bits) | expert (6 bits) | weight (15 bits)");
+static_assert(A <= moe_block_plan_words::kAccMax && N <= moe_block_plan_words::kMaxChips, "the plan's want[A][N]");
 constexpr auto rt_args = TensorAccessorArgs<RAP_CT0>();
 constexpr auto sl_args = TensorAccessorArgs<rt_args.next_compile_time_args_offset()>();
 
@@ -246,7 +248,7 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
             }
         }
         uint32_t* wr = reinterpret_cast<uint32_t*>(B + O_WANT);
-        const auto pgg = TensorAccessor(ra_acc::plan, plan_addr, 4096);
+        const auto pgg = TensorAccessor(ra_acc::plan, plan_addr, moe_block_plan_words::kPlanBytes);
         for (uint32_t i = 0, aa = q; aa < A; ++i, aa += M) {
             uint32_t want[N], nloc = 0;
             for (uint32_t s = 0; s < N; ++s) {
@@ -270,11 +272,15 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
                     }
                 }
             }
-            for (uint32_t s = 0; s < 32; ++s) {
+            for (uint32_t s = 0; s < moe_block_plan_words::kMaxChips; ++s) {
                 wr[i * 32 + s] = s < N ? want[s] : 0;
             }
-            noc_async_write(B + O_WANT + i * 128, pgg.get_noc_addr(0) + (32 + aa * 32) * 4, 128);
-            noc_inline_dw_write(get_noc_addr(px[0], py[0], bb[0] + O_PLAN + (16 + aa) * 4), nloc);
+            noc_async_write(
+                B + O_WANT + i * 128,
+                pgg.get_noc_addr(0) + (moe_block_plan_words::kPlanWant + aa * moe_block_plan_words::kMaxChips) * 4,
+                128);
+            noc_inline_dw_write(
+                get_noc_addr(px[0], py[0], bb[0] + O_PLAN + (moe_block_plan_words::kPlanNloc + aa) * 4), nloc);
         }
     }
     // (5) every packet of the call: core 0 waits, then wakes the others
@@ -494,7 +500,8 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
             noc_async_write(B + O_TAB + (pg - R0 / 32) * 256, tg.get_noc_addr(pg), 256);
         }
     }
-    // (7) n_inj / n_ret partials to core 0; core 0 writes counts / regions and the plan's words 0..31 and 600, 601
+    // (7) n_inj / n_ret partials to core 0; core 0 writes counts / regions, the plan's head words (n_inj, n_ret,
+    // n_local) and its rows block (combine_plan_words.hpp)
     {
         uint32_t* pin = reinterpret_cast<uint32_t*>(B + O_PIN + q * 64);
         for (uint32_t i = 0; i < 8; ++i) {
@@ -512,12 +519,12 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
         noc_semaphore_wait(reinterpret_cast<volatile tt_l1_ptr uint32_t*>(parts_sem), M - 1);
         *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(parts_sem) = 0;
         invalidate_l1_cache();
-        uint32_t* plan = reinterpret_cast<uint32_t*>(B + O_PLAN);  // (words 16..31: n_local, from the owners)
-        for (uint32_t i = 0; i < 16; ++i) {
+        uint32_t* plan = reinterpret_cast<uint32_t*>(B + O_PLAN);  // (n_local[]: from the owners)
+        for (uint32_t i = 0; i < moe_block_plan_words::kPlanNloc; ++i) {
             plan[i] = 0;
         }
-        for (uint32_t aa = A; aa < 16; ++aa) {
-            plan[16 + aa] = 0;  // (no accumulator: no owner writes it)
+        for (uint32_t aa = A; aa < moe_block_plan_words::kPlanWant - moe_block_plan_words::kPlanNloc; ++aa) {
+            plan[moe_block_plan_words::kPlanNloc + aa] = 0;  // (no accumulator: no owner writes it)
         }
         for (uint32_t r = 0; r < M; ++r) {
             const uint32_t* pr = reinterpret_cast<const uint32_t*>(B + O_PIN + r * 64);
@@ -525,15 +532,16 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
                 plan[i] += pr[i];
             }
         }
-        uint32_t* rows = reinterpret_cast<uint32_t*>(B + O_ROWS);  // (plan words 592..607)
+        uint32_t* rows = reinterpret_cast<uint32_t*>(B + O_ROWS);  // (the plan's rows block: 16 words)
         for (uint32_t i = 0; i < 16; ++i) {
             rows[i] = 0;
         }
         rows[8] = off;
         rows[9] = off > ROWS_CAP ? 1 : 0;
-        const uint64_t plan_noc = TensorAccessor(ra_acc::plan, plan_addr, 4096).get_noc_addr(0);
-        noc_async_write(B + O_PLAN, plan_noc, 128);
-        noc_async_write(B + O_ROWS, plan_noc + 592 * 4, 64);
+        const uint64_t plan_noc =
+            TensorAccessor(ra_acc::plan, plan_addr, moe_block_plan_words::kPlanBytes).get_noc_addr(0);
+        noc_async_write(B + O_PLAN, plan_noc, moe_block_plan_words::kPlanHeadBytes);
+        noc_async_write(B + O_ROWS, plan_noc + moe_block_plan_words::kPlanRowsBlock * 4, 64);
     }
     noc_async_write_barrier();
     noc_async_atomic_barrier();

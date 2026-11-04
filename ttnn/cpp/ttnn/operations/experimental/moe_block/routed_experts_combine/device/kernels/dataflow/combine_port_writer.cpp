@@ -16,6 +16,7 @@
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_worker_adapters.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
 #include "combine_zero_gate.hpp"
+#include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 using namespace tt::tt_fabric;
 
 constexpr uint32_t cb_inj = get_compile_time_arg_val(0);
@@ -90,7 +91,7 @@ void kernel_main() {
     {  // (the device plan: this port's counts at its id)
         const uint32_t plan = get_arg_val<uint32_t>(a++), pid = get_arg_val<uint32_t>(a++);
         const uint32_t sc = (area + MISC + 832 + 63) & ~63u;
-        noc_async_read(TensorAccessor(plan_args, plan, 4096).get_noc_addr(0), sc, 64);  // n_inj[8], n_ret[8]
+        noc_async_read(TensorAccessor(plan_args, plan, moe_block_plan_words::kPlanBytes).get_noc_addr(0), sc, 64);  // n_inj[8], n_ret[8]
         noc_async_read_barrier();
         n_inj = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc)[pid];
         n_ret = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc)[8 + pid];

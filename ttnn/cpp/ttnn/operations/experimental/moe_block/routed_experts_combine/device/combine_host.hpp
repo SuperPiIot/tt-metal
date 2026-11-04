@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 #include "ttnn/operations/experimental/moe_block/common/mesh_routing.hpp"
 #include "ttnn/operations/experimental/moe_block/common/moe_block_config.hpp"
 
@@ -26,8 +27,8 @@ inline constexpr uint32_t kMiscBytes = 2048;            // MISC
 inline constexpr uint32_t kMiscRtot = 256;              // MISC words: rows consumed per source chip
 inline constexpr uint32_t kMiscRdone = 288;             // MISC words: rows covered by the credit snapshots sent
 inline constexpr uint32_t kMiscTaken = 320;             // MISC words: an accumulator's taken[] per ring
-inline constexpr uint32_t kAccMax = 16;                 // A_MAX: accumulators at most (state layout, device planner)
-inline constexpr uint32_t kMaxChips = 32;               // N at most (the plan's want[16][32], 32-bit masks)
+inline constexpr uint32_t kAccMax = moe_block_plan_words::kAccMax;      // A_MAX: accumulators at most (the plan's want[])
+inline constexpr uint32_t kMaxChips = moe_block_plan_words::kMaxChips;  // N at most (want[][32], 32-bit chip masks)
 inline constexpr uint32_t kTabCbBytes = 256 * 8 + 128;  // CB_TAB: the device plan's scratch reads
 inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off writers' words: 64 B rows
 // shared landing: slot grants outstanding a (source, accumulator) at most (4: 2x4 GLM-5.3-Flash 1280 experts + combine
@@ -35,10 +36,11 @@ inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off write
 inline constexpr uint32_t kGrants = 4;
 inline constexpr uint32_t kSharedPslMax = 254;  // shared landing: slot owners are bytes (0xFF: free)
 
-// Plan tensor word offsets (combine_plan: P_NINJ, P_NRET, P_NLOC, P_WANT, P_ROWS, P_OVER).
-inline constexpr uint32_t kPlanWords = 1024;
-inline constexpr uint32_t kPlanNinj = 0, kPlanNret = 8, kPlanNloc = 16, kPlanWant = 32, kPlanRows = 600,
-                          kPlanOver = 601;
+// Plan tensor word offsets (common/combine_plan_words.hpp, shared with the kernels).
+inline constexpr uint32_t kPlanWords = moe_block_plan_words::kPlanWords;
+inline constexpr uint32_t kPlanNinj = moe_block_plan_words::kPlanNinj, kPlanNret = moe_block_plan_words::kPlanNret,
+                          kPlanNloc = moe_block_plan_words::kPlanNloc, kPlanWant = moe_block_plan_words::kPlanWant,
+                          kPlanRows = moe_block_plan_words::kPlanRows, kPlanOver = moe_block_plan_words::kPlanOver;
 
 inline constexpr uint32_t align64(uint64_t v) { return static_cast<uint32_t>((v + 63) / 64 * 64); }
 

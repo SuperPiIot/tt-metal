@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "head_sizing.hpp"
+#include "ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1369,14 +1370,15 @@ RoutingSizes routing_a2a_sizes(
     const int64_t plan_l1 = al64((S / TPP) * al64(int64_t(TPP) * 4 * K)) + al64(4 * int64_t(M) * N) + al64(4 * N) +
                             N * BBP + al64(4 * TSM * K + 16 * int64_t(N)) + N * HBP +
                             al64(4 * IC + 128 * int64_t(N) * M) + al64(4 * int64_t(N) * M) +
-                            al64(2 * int64_t(EPC) * S) + al64(4 * IR) + al64(8 * IR) + al64(128 * NOWN) + M * 64 + 128 +
+                            al64(2 * int64_t(EPC) * S) + al64(4 * IR) + al64(8 * IR) + al64(128 * NOWN) + M * 64 + moe_block_plan_words::kPlanHeadBytes +
                             2 * al64(4 * (int64_t(EPC) + 32)) + 64 + N * al16(2 * int64_t(EPC)) +
                             NM * M * al16(2 * int64_t(EPC)) + al64(NM * al16(2 * int64_t(EPC))) + 128;
     const int64_t port_l1 = int64_t(N) * PCAP + 64;
     std::vector<std::string> why;
-    if (N > 32 || A > 16 || K % 2 || S % TPP || !(1 <= M && M <= std::min({EPC, A, 16u}))) {
+    if (N > moe_block_plan_words::kMaxChips || A > moe_block_plan_words::kAccMax || K % 2 || S % TPP || !(1 <= M && M <= std::min({EPC, A, 16u}))) {
         why.push_back(
-            "shape: N " + std::to_string(N) + " <= 32, A " + std::to_string(A) + " <= 16, K " + std::to_string(K) +
+            "shape: N " + std::to_string(N) + " <= 32, A " + std::to_string(A) + " <= " +
+            std::to_string(moe_block_plan_words::kAccMax) + ", K " + std::to_string(K) +
             " even, S " + std::to_string(S) + " % " + std::to_string(TPP) + ", M " + std::to_string(M) +
             " <= min(EPC, A, 16)");
     }

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 #include "combine_zero_gate.hpp"
+#include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 constexpr uint32_t cb_inj = get_compile_time_arg_val(0);
 constexpr uint32_t cb_tab = get_compile_time_arg_val(1);
@@ -33,7 +34,7 @@ void kernel_main() {
     {
         cb_reserve_back(cb_tab, 1);
         const uint32_t sc = (get_write_ptr(cb_tab) + 63) & ~63u;
-        noc_async_read(TensorAccessor(plan_args, plan, 4096).get_noc_addr(0), sc, 64);
+        noc_async_read(TensorAccessor(plan_args, plan, moe_block_plan_words::kPlanBytes).get_noc_addr(0), sc, 64);
         noc_async_read_barrier();
         n = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc)[did];
     }

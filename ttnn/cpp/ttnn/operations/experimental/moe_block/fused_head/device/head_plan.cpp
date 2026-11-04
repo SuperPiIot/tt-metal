@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "head_plan.hpp"
+#include "ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -574,8 +575,9 @@ std::string shape_checks(const HeadShape& shape) {
                "; nearest valid " + s(nxt);
     }
     const uint32_t N = shape.N(), S = shape.S(), EPC = shape.EPC();
-    if (N > 32 || shape.A > 16) {
-        return "routing planner: N " + s(N) + " <= 32 chips, accumulators " + s(shape.A) + " <= 16";
+    if (N > moe_block_plan_words::kMaxChips || shape.A > moe_block_plan_words::kAccMax) {
+        return "routing planner: N " + s(N) + " <= 32 chips, accumulators " + s(shape.A) + " <= " +
+               s(moe_block_plan_words::kAccMax);
     }
     if (S > 2048) {
         return "routing planner: " + s(S) + " tokens a chip > 2048 (an entry's token field); chunk <= " + s(2048 * N) +

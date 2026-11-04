@@ -14,6 +14,7 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 #include "combine_zero_gate.hpp"
+#include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 constexpr uint32_t cb_row = get_compile_time_arg_val(0);
 constexpr uint32_t cb_meta = get_compile_time_arg_val(1);
@@ -80,13 +81,14 @@ void kernel_main() {
     const uint32_t sc = (get_write_ptr(cb_tab) + 63) & ~63u;  // (CB_TAB: scratch - the plan's words, the free list)
     uint32_t n_local = 0;
     {  // (the device plan: n_local and want[] of this accumulator)
-        const uint64_t plan_noc = TensorAccessor(plan_args, plan, 4096).get_noc_addr(0);
-        noc_async_read(plan_noc + 64, sc, 64);                        // n_local[16]
-        noc_async_read(plan_noc + (32 + me * 32) * 4, sc + 64, 128);  // want[me][32]
+        namespace pw = moe_block_plan_words;  // (n_local[kAccMax] at sc, want[me] at sc + 128: below own[] at sc + 256)
+        const uint64_t plan_noc = TensorAccessor(plan_args, plan, pw::kPlanBytes).get_noc_addr(0);
+        noc_async_read(plan_noc + pw::kPlanNloc * 4, sc, 4 * pw::kAccMax);  // n_local[kAccMax]
+        noc_async_read(plan_noc + (pw::kPlanWant + me * pw::kMaxChips) * 4, sc + 4 * pw::kAccMax, 128);  // want[me]
         noc_async_read_barrier();
         n_local = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc)[me];
         for (uint32_t k = 0; k < N; ++k) {
-            want[k] = k == hc ? 0 : reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc + 64)[k];
+            want[k] = k == hc ? 0 : reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sc + 4 * pw::kAccMax)[k];
         }
     }
     uint32_t n_rows = n_local;

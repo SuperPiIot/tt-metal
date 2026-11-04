@@ -52,7 +52,7 @@ def test_auto_invariants():
             lay = got["layout"]
             assert lay["fits"] and lay["PSL"] >= N - 1 and lay["PSL"] < 4096
             assert max(lay["acc_used"], lay["port_used"]) <= arena
-            assert 1 <= got["n_acc"] <= 16
+            assert 1 <= got["n_acc"] <= 32  # (kAccMax)
     counts = collections.Counter(len(mb.combine_state_layout(N, A)) for N in (8, 32) for A in (1, 16))
     assert counts == {10: 4}
 

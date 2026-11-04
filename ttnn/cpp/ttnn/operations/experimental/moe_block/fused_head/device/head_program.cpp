@@ -31,6 +31,7 @@
 #include "ttnn/distributed/api.hpp"
 #include "ttnn/types.hpp"
 #include "ttnn/tensor/tensor_utils.hpp"
+#include "ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 namespace ttnn::operations::experimental::moe_block::fused_head {
 
@@ -66,7 +67,7 @@ constexpr uint32_t kIncEvery = 8;
 constexpr uint8_t kXgCb = 0;
 // router_stream's CB ids
 enum RtCb : uint8_t { RT_HOLD = 2, ARRF = 3, ARRB = 4, BIAS = 5, SC = 6, PSYNC = 8, BEST = 9, IDX = 11, RDY = 12 };
-constexpr uint32_t kPlanWords = 1024;
+constexpr uint32_t kPlanWords = moe_block_plan_words::kPlanWords;  // (the combine's device plan)
 
 uint32_t u32(size_t v) { return static_cast<uint32_t>(v); }
 using head_math::al16;
