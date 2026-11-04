@@ -161,6 +161,9 @@ void kernel_main() {
     // source the grants outstanding and issued this call
     volatile tt_l1_ptr uint8_t* own = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(sc + 256);
     volatile tt_l1_ptr uint16_t* fstack = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 512);
+    // a source's granted slots in grant order - it fills them in that order (one port, one path), so its oldest
+    // outstanding grant, at (issued - outstanding) % G, is the only one to check
+    volatile tt_l1_ptr uint16_t* gq = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 1024);
     uint32_t gout[N], giss[N], nfree = 0;
     auto grant = [&](uint32_t k, uint32_t slot) {  // (the id into the home port's grant ring, then its count)
         const uint32_t seq = t0[k] + giss[k];
@@ -169,6 +172,7 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(px[k], py[k], area + RET + 4 * (k * AP + me)), 1);
         noc_semaphore_inc(get_noc_addr(px[k], py[k], area + MISC + 4 * (MRTOT + k)), 1);
         own[slot] = static_cast<uint8_t>(k);
+        gq[k * G + giss[k] % G] = static_cast<uint16_t>(slot);
         ++giss[k];
         ++gout[k];
     };
@@ -186,7 +190,7 @@ void kernel_main() {
                 }
             }
             if (bk == N) {
-                return;
+                break;
             }
             grant(bk, fstack[--nfree]);
         }
@@ -307,11 +311,11 @@ void kernel_main() {
                 break;
             }
         }
-        if constexpr (SHARED) {  // (every granted slot, in any order; freed slots granted again at once)
+        if constexpr (SHARED) {  // (each source's oldest grant only; freed slots granted again at once)
             bool any = false;
-            for (uint32_t i = 0; i < PSL; ++i) {
-                if (own[i] != 0xFF) {
-                    any = take_slot(i) || any;
+            for (uint32_t k = 0; k < N; ++k) {
+                while (gout[k] && take_slot(gq[k * G + (giss[k] - gout[k]) % G])) {
+                    any = true;
                 }
             }
             if (any) {

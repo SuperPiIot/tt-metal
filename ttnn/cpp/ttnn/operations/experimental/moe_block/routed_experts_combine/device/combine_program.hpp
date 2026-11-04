@@ -63,6 +63,7 @@ struct CombinePlanInputs {
     std::optional<CombineMode> mode;             // ... and its mode
     uint32_t depth = 8;
     std::optional<CombineLanding> landing;       // nullopt: rings
+    std::optional<uint32_t> credit_batch;        // nullopt: the planner's (credit_policy)
 };
 
 // Everything the combine's program needs that depends only on the mesh, the config and the plan inputs: computed once

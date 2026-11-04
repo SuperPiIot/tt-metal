@@ -192,10 +192,20 @@ CombineAuto combine_auto(
     return res;
 }
 
-CreditPolicy credit_policy() {
-    // idle credit snapshots batched (at least 8 rows, or 6 us old): Galaxy -9 %; on the 1x4 ring experts + combine
-    // unchanged (GLM-5.3-Flash 750.1 -> 749.5 us, K3 1473.7 -> 1473.9)
-    return CreditPolicy{};
+CreditPolicy credit_policy(uint32_t N, uint32_t D, bool shared, std::optional<uint32_t> batch) {
+    // With >= 16 sources (the Galaxy) idle snapshots batched, 8 rows or 6 us old: the snapshots' own traffic counts
+    // there (GLM-5.3 at its Galaxy D 2, 31 sources emulated: fused 836 -> 762 us). With fewer, a batch is never more
+    // than half a source's slots - a source with D slots waited for 8 consumed rows, or the age (2x4 GLM-5.3-Flash 1280
+    // rings experts + combine 723 -> 532 us at D 2, 1307 -> 888 at D 1, 515 at D 8 either way); shared: a grant is on
+    // its source's critical path - every snapshot at once (688 -> 546 us at D 2, 1172 -> 800 at D 1).
+    CreditPolicy p;
+    const uint32_t b = batch ? std::max<uint32_t>(1, *batch)
+                       : N > 16 ? 8u
+                       : shared ? 1u
+                                : std::clamp<uint32_t>(D / 2, 1, 8);
+    p.cred_thr = b;
+    p.cred_idle = b;
+    return p;
 }
 
 uint32_t fused_arena_reserve(uint32_t flat_static_bytes) {

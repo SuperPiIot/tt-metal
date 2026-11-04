@@ -29,8 +29,16 @@ ARENAS = [64 << 10, 400 << 10, 900 << 10, 1200 << 10, 1400 << 10]
 
 
 def test_credit_policy():
-    """Credits go back every 8 consumed rows; idle snapshots batched (8 rows or 8100 cycles old) on every mesh."""
+    """With >= 16 sources (the Galaxy) credits go back every 8 consumed rows, idle snapshots batched (8 rows or 8100
+    cycles old); with fewer, a batch is at most half a source's slots (D), the shared landing's grants at once; a
+    config's credit_batch wins."""
     assert mb.combine_credit_policy() == (8, 8, 8100)
+    assert mb.combine_credit_policy(N=32, D=2) == (8, 8, 8100)
+    assert mb.combine_credit_policy(N=8, D=8) == (4, 4, 8100)
+    assert mb.combine_credit_policy(N=8, D=2) == (1, 1, 8100)
+    assert mb.combine_credit_policy(N=8, D=24) == (8, 8, 8100)
+    assert mb.combine_credit_policy(N=8, D=8, shared=True) == (1, 1, 8100)
+    assert mb.combine_credit_policy(N=32, D=2, batch=1) == (1, 1, 8100)
 
 
 def test_auto_invariants():

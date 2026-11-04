@@ -141,6 +141,7 @@ CombineL1Plan plan_routed_experts_combine_l1(
     in.mode = combine.mode;
     in.depth = combine.depth;
     in.landing = combine.landing;
+    in.credit_batch = combine.credit_batch;
     in.arena_bytes = out.arena_bytes;
     out.plan = make_combine_plan(mesh, res, in);
     return out;

@@ -30,7 +30,9 @@ inline constexpr uint32_t kAccMax = 16;                 // A_MAX: accumulators a
 inline constexpr uint32_t kMaxChips = 32;               // N at most (the plan's want[16][32], 32-bit masks)
 inline constexpr uint32_t kTabCbBytes = 256 * 8 + 128;  // CB_TAB: the device plan's scratch reads
 inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off writers' words: 64 B rows
-inline constexpr uint32_t kGrants = 8;    // shared landing: slot grants outstanding a (source, accumulator) at most
+// shared landing: slot grants outstanding a (source, accumulator) at most (4: 2x4 GLM-5.3-Flash 1280 experts + combine
+// 560 / 694 / 1157 us at D 8 / 2 / 1 vs 584 / 688 / 1172 at 8, 591 / 699 / 1194 at 16)
+inline constexpr uint32_t kGrants = 4;
 inline constexpr uint32_t kSharedPslMax = 254;  // shared landing: slot owners are bytes (0xFF: free)
 
 // Plan tensor word offsets (combine_plan: P_NINJ, P_NRET, P_NLOC, P_WANT, P_ROWS, P_OVER).
@@ -131,14 +133,16 @@ CombineAuto combine_auto(
     CombineLanding landing = CombineLanding::Rings);
 
 // The credit policy: a port returns a source's credits once it consumed CRED_THR of its rows; its idle credit
-// snapshots are batched (CRED_IDLE rows, or CRED_AGE cycles old) on every mesh.
+// snapshots are batched (CRED_IDLE rows, or CRED_AGE cycles old). N chips, D landing slots a source chip (average);
+// batch: CombineConfig.credit_batch (rows a snapshot covers, 1 at once), else the planner's.
 struct CreditPolicy {
     uint32_t cred_thr = 8;
     uint32_t cred_idle = 8;
     uint32_t cred_age = 8100;
     bool operator==(const CreditPolicy&) const = default;
 };
-CreditPolicy credit_policy();
+CreditPolicy credit_policy(
+    uint32_t N = 32, uint32_t D = 16, bool shared = false, std::optional<uint32_t> batch = std::nullopt);
 
 // fused_arena_reserve / exchange_arena_reserve: bytes a bank keeps below the combine's arena over a call (the static
 // CBs of the programs that run while it is allocated, the y writers' words, slack), and the arena budget (bytes a

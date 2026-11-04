@@ -77,6 +77,7 @@ void bind_routed_experts_combine(nb::module_& mod) {
         .def_rw("arena_bytes", &CombineConfig::arena_bytes)
         .def_rw("depth", &CombineConfig::depth)
         .def_rw("landing", &CombineConfig::landing)
+        .def_rw("credit_batch", &CombineConfig::credit_batch)
         .def(nb::self == nb::self);
 
     ttnn::bind_function<"routed_experts_combine", "ttnn.experimental.moe_block.">(
@@ -192,11 +193,16 @@ void bind_routed_experts_combine(nb::module_& mod) {
         "The combine's automatic configuration as a dict (mode: a CombineMode, or none for the best).");
     mod.def(
         "combine_credit_policy",
-        [] {
-            const auto p = credit_policy();
+        [](uint32_t N, uint32_t D, bool shared, std::optional<uint32_t> batch) {
+            const auto p = credit_policy(N, D, shared, batch);
             return nb::make_tuple(p.cred_thr, p.cred_idle, p.cred_age);
         },
-        "The combine's credit policy: (CRED_THR, CRED_IDLE, CRED_AGE).");
+        nb::arg("N") = 32,
+        nb::arg("D") = 16,
+        nb::arg("shared") = false,
+        nb::arg("batch").none() = nb::none(),
+        "The combine's credit policy at D landing slots a source chip (and the shared landing): (CRED_THR, CRED_IDLE, "
+        "CRED_AGE).");
     mod.def(
         "routed_experts_combine_l1_plan",
         [](MoEBlockResources& resources,

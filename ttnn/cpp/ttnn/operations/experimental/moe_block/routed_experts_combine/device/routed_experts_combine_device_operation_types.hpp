@@ -29,6 +29,9 @@ struct CombineConfig {
     // the landing pool: rings (one a source chip) or shared (slot grants; accumulators apart from the ports);
     // nullopt: the planner's (rings)
     std::optional<CombineLanding> landing;
+    // credit / grant snapshots: rows a snapshot covers before it goes back (1: at once); nullopt: the planner's (8 with
+    // >= 16 sources, else at most half a source's slots, shared at once)
+    std::optional<uint32_t> credit_batch;
 
     bool operator==(const CombineConfig&) const = default;
 };
