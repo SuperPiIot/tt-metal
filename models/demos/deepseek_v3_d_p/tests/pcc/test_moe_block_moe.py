@@ -52,20 +52,38 @@ def _random_moe_weights(hidden, inter, n_routed, seed):
     return gate, [expert() for _ in range(n_routed)], expert()
 
 
+_GLM_BLOCK_PARAMS = dict(
+    fabric_payload_size=_PAYLOAD,
+    worker_l1_size=ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE,
+    l1_small_size=_L1_SMALL,
+    trace_region_size=64 << 20,
+)
+GLM_BLOCK_CHUNK = int(os.environ.get("GLM_BLOCK_CHUNK", str(CHUNK)))  # (tokens a call)
+
+
 @pytest.mark.parametrize(
     "mesh_device, device_params",
     [
         pytest.param(
             (8, 4),
-            torus_xy_device_params(
-                fabric_payload_size=_PAYLOAD,
-                worker_l1_size=ttnn._ttnn.device.DEFAULT_WORKER_L1_SIZE,
-                l1_small_size=_L1_SMALL,
-                trace_region_size=64 << 20,
-            ),
+            torus_xy_device_params(**_GLM_BLOCK_PARAMS),
             marks=pytest.mark.requires_mesh_topology(mesh_shape=(8, 4), topology="mesh-8x4"),
             id="torus-xy-8x4",
-        )
+        ),
+        # 4x4 stages (half a Galaxy, test_k3_moe_block's sub-torus descriptors and TT_VISIBLE_DEVICES): SP ring /
+        # TP line (TorusY) and both rings (TorusXY)
+        pytest.param(
+            (4, 4),
+            torus_y_device_params(**_GLM_BLOCK_PARAMS),
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 4), topology="mesh-4x4"),
+            id="torus-y-4x4",
+        ),
+        pytest.param(
+            (4, 4),
+            torus_xy_device_params(**_GLM_BLOCK_PARAMS),
+            marks=pytest.mark.requires_mesh_topology(mesh_shape=(4, 4), topology="mesh-4x4"),
+            id="torus-xy-4x4",
+        ),
     ],
     indirect=True,
 )
@@ -80,7 +98,8 @@ def test_glm_moe_block(mesh_device, device_params):
     sd = {"gate_weights": gate, "routed_expert_weights": routed, "shared_expert_weights": shared}
     ffn = TtK3MoEBlockFfn(mesh_device, GLM53Config, layer_idx=6, state_dict=sd)
 
-    x = (torch.randn(1, 1, CHUNK, H, generator=torch.Generator().manual_seed(7)) * 0.5).to(torch.bfloat16)
+    S = GLM_BLOCK_CHUNK
+    x = (torch.randn(1, 1, S, H, generator=torch.Generator().manual_seed(7)) * 0.5).to(torch.bfloat16)
     x_tt = ttnn.from_torch(
         x,
         dtype=ttnn.bfloat16,
@@ -88,6 +107,15 @@ def test_glm_moe_block(mesh_device, device_params):
         device=mesh_device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
         mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=(R, C), dims=(2, 3)),
+    )
+    block = ffn._block(S)  # (before the first call, so a head that does not fit still logs it)
+    # (the combine's L1 plan: accumulators A, landing depth D a source chip, rings QP / QL)
+    cp = ttnn.experimental.moe_block.routed_experts_combine_l1_plan(
+        block.resources, dispatch_group=block.plan.l1.dispatch_group, **block.expert_kw
+    )
+    logger.info(
+        f"GLMCOMBINE {R}x{C} {S} tokens ({S // (R * C)} rows a chip owns): A {cp['A']}, landing depth D {cp['D']} a "
+        f"source chip, QP {cp['QP']}, QL {cp['QL']}, acc_on_ports {cp['acc_on_ports']}, arena {cp['arena_bytes']} B"
     )
     y_tt = ffn(x_tt)  # (the build and the weights, then one call)
     ttnn.synchronize_device(mesh_device)
@@ -106,7 +134,7 @@ def test_glm_moe_block(mesh_device, device_params):
         routed_scaling_factor=GLM53Config.ROUTE_SCALE,
     ).float()
     ok, msg = comp_pcc(want.reshape(-1, H), y.reshape(-1, H), FINAL_PCC)
-    logger.info(f"MoE block (GLM-5.3, random weights, {CHUNK} tokens) vs the CPU MoE: {msg}")
+    logger.info(f"MoE block (GLM-5.3, random weights, {S} tokens, {R}x{C}) vs the CPU MoE: {msg}")
     ttnn.deallocate(y_tt)
     assert ok, f"MoE block vs the CPU MoE: {msg} (need {FINAL_PCC})"
 
@@ -130,7 +158,7 @@ def test_glm_moe_block(mesh_device, device_params):
     ttnn.release_trace(mesh_device, tid)
     ttnn.deallocate(y_tr)
     logger.info(
-        f"GLMBLOCK {CHUNK} tokens: eager {eager * 1e3:.2f} ms a call, traced {traced * 1e3:.2f} ms a replay; the traced "
+        f"GLMBLOCK {R}x{C} {S} tokens: eager {eager * 1e3:.2f} ms a call, traced {traced * 1e3:.2f} ms a replay; the traced "
         f"output bit-identical to the eager one: {bool(torch.equal(y2, y))}"
     )
 
