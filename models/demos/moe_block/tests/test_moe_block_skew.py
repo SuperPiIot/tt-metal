@@ -34,7 +34,6 @@ from models.demos.moe_block.tt.moe_block import MoEBlock, MoEBlockWeights
 
 R, C = 2, 4
 CHUNK = 1280
-ACC = 9  # (the combine plans 9 accumulators on the LoudBox's 11x10 grid)
 E, K, H, I, Is = 288, 8, 4096, 2048, 2048  # GLM-5.3-Flash
 SNAP = 2.0**-14
 LATE, IDLE = (1, 3), (1, 2)  # (the cold, idle chips: the last two, the last one late)
@@ -241,7 +240,7 @@ def setup(mesh):
     cfg = mb.MoEBlockConfig(chunk_tokens=CHUNK, num_links=2, persist_l1_small=True)
     cfg.combine_snap = SNAP
     res = mb.MoEBlockResources(mesh, dims, cfg, dtypes)
-    block = MoEBlock(mesh, res, dtypes=dtypes, accumulators=ACC, activation=fw.ACTS["silu"])
+    block = MoEBlock(mesh, res, dtypes=dtypes, activation=fw.ACTS["silu"])  # (the planner's accumulators)
     g = torch.Generator().manual_seed(5)
     rnd = lambda *s, sc=1.0: torch.randn(*s, generator=g) * sc  # noqa: E731
     f32 = lambda t: ttnn.from_torch(t, dtype=ttnn.float32)  # noqa: E731
@@ -250,7 +249,7 @@ def setup(mesh):
         bias[(r * C + c) * EPC : (r * C + c + 1) * EPC] -= 100.0
     head_w = mb.prepare_fused_head_weights(
         f32(rnd(Is, H, sc=H**-0.5)), f32(rnd(Is, H, sc=H**-0.5)), f32(rnd(H, Is, sc=Is**-0.5)), None,
-        f32(rnd(E, H, sc=H**-0.5)), f32(bias), resources=res, dtypes=dtypes, accumulators=ACC,
+        f32(rnd(E, H, sc=H**-0.5)), f32(bias), resources=res, dtypes=dtypes, accumulators=block.accumulators,
     )  # fmt: skip
     distinct = [(rnd(H, I, sc=H**-0.5), rnd(H, I, sc=H**-0.5), rnd(I, H, sc=I**-0.5)) for _ in range(4)]
     gids = [list(range(c * EPC, (c + 1) * EPC)) for c in range(N)]
@@ -269,8 +268,8 @@ def setup(mesh):
     out = ttnn.from_torch(
         torch.zeros(1, 1, ncores, 16, dtype=torch.int64), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, **rep
     )
-    st = mb.combine_state_layout(N, ACC)  # (CRED, USED, RET, LAYR, LAYO, U0, CNT, MISC, HDRS, RINGS)
-    AP = (ACC + 3) // 4 * 4
+    st = mb.combine_state_layout(N, block.accumulators)  # (CRED, USED, RET, LAYR, LAYO, U0, CNT, MISC, HDRS, RINGS)
+    AP = (block.accumulators + 3) // 4 * 4
     skew = _Skew(block.mb, mesh, dummy, out, (st[3], N * AP))
     block.mb = skew
     skew.block = block

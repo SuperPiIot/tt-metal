@@ -33,7 +33,6 @@ from models.demos.moe_block.tt.moe_block import MoEBlock, MoEBlockWeights
 
 R, C = 2, 4
 CHUNK = int(os.environ.get("MOE_PAD_CHUNK", "1280"))
-ACC = 9  # (the combine plans 9 accumulators on the LoudBox's 11x10 grid)
 E, K, H, I, Is = 288, 8, 4096, 2048, 2048  # GLM-5.3-Flash
 SNAP = 2.0**-14
 REPO = Path(__file__).resolve().parents[4]
@@ -98,12 +97,12 @@ def setup(mesh, request):
     cfg.combine_snap = SNAP
     cfg.head_router_iterations = request.param
     res = mb.MoEBlockResources(mesh, dims, cfg, dtypes)
-    block = MoEBlock(mesh, res, dtypes=dtypes, accumulators=ACC, activation=fw.ACTS["silu"])
+    block = MoEBlock(mesh, res, dtypes=dtypes, activation=fw.ACTS["silu"])  # (the planner's accumulators)
     g = torch.Generator().manual_seed(3)
     r = lambda *s, sc=1.0: ttnn.from_torch(torch.randn(*s, generator=g) * sc, dtype=ttnn.float32)
     head_w = mb.prepare_fused_head_weights(
         r(Is, H, sc=H**-0.5), r(Is, H, sc=H**-0.5), r(H, Is, sc=Is**-0.5), None, r(E, H, sc=H**-0.5), r(E, sc=0.01),
-        resources=res, dtypes=dtypes, accumulators=ACC,
+        resources=res, dtypes=dtypes, accumulators=block.accumulators,
     )  # fmt: skip
     EPC = E // N
     distinct = [
