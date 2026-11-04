@@ -63,9 +63,10 @@ enum EngineCb : uint8_t {
     CB_PSTAGE = 13,
     CB_PCOUNT = 14,
     CB_POLL = 15,
+    CB_WD = 16,  // the engine's step words, this call's (zeroed each call): after the landing CB, one address everywhere
 };
 // TailA2A's.
-enum A2ACb : uint8_t { CB_A2A_RM = 0, CB_A2A_T = 1, CB_A2A_SE = 2, CB_A2A_OUT = 3, CB_A2A_CH = 4 };
+enum A2ACb : uint8_t { CB_A2A_RM = 0, CB_A2A_T = 1, CB_A2A_SE = 2, CB_A2A_OUT = 3, CB_A2A_CH = 4, CB_A2A_ZR = 5 };
 
 KernelDescriptor kernel(const std::string& file, const CoreRangeSet& cores, KernelDescriptor::ConfigDescriptor config) {
     KernelDescriptor k;
@@ -131,7 +132,7 @@ uint32_t index_of(const std::vector<uint32_t>& v, uint32_t x) {
 }
 
 // The buffers the runtime args address, by source (address_patches.hpp; nullptr: absent).
-std::array<Buffer*, 9> sources_of(const FusedTailInputs& a, const Tensor& output) {
+std::array<Buffer*, 7> sources_of(const FusedTailInputs& a, const Tensor& output) {
     const auto opt = [](const std::optional<Tensor>& t) { return t.has_value() ? t->buffer() : nullptr; };
     return {
         a.y_own.buffer(),
@@ -139,8 +140,6 @@ std::array<Buffer*, 9> sources_of(const FusedTailInputs& a, const Tensor& output
         opt(a.w_up),
         output.buffer(),
         a.ready.buffer(),
-        a.words.buffer(),
-        opt(a.port_epoch),
         opt(a.arrival),
         opt(a.staging)};
 }
@@ -233,9 +232,7 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
     Buffer* w = args.w_up->buffer();
     Buffer* se = args.shared_expert->buffer();
     Buffer* out = output.buffer();
-    Buffer* words = args.words.buffer();
     Buffer* ready = args.ready.buffer();
-    Buffer* epoch = args.port_epoch->buffer();
 
     auto virt = [&](uint32_t cx, uint32_t cy) { return mesh->worker_core_from_logical_core(CoreCoord(cx, cy)); };
     auto node = [&](uint32_t r, uint32_t c) { return mesh->get_fabric_node_id(ttnn::MeshCoordinate(r, c)); };
@@ -266,6 +263,9 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
     };
     // (the landing slots of every step, SHMAX pages each: own steps tilized here, the others landed by the gather)
     engine_cb(CB_L0, "land", g.NSTMAX * g.SHMAX * kPage, bf16, kPage, {g.SHMAX});
+    // (the step words right after it, also on engine and ports: landed, the row's shares, the E tiles - 16 B each)
+    const uint32_t wd_bytes = 16 * (3 * g.NSTMAX + 1 + g.NSTMAX * GX);
+    cbs.push_back(cb(CB_WD, both, wd_bytes, tt::DataFormat::UInt32, wd_bytes));
     engine_cb(CB_W, "w", g.KH * g.PNMAX * g.wtb, w_fmt, g.wtb, {1});
     engine_cb(CB_A, "ring", g.NSLOT * g.KH * kPage, bf16, kPage, {g.KH});
     engine_cb(CB_PART, "part", g.NSLOT * GX * 4096, fp32, 4096, {GX});
@@ -308,6 +308,12 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
         u32(std::max(g0.y, g1.y)),
         GX * GY};
     const uint32_t wreg = g.region_tiles();
+    std::vector<uint32_t> port_xy;  // (the port cores the zero gate releases once each: x | y << 16)
+    for (const auto& range : ports.ranges()) {
+        for (const auto& core : range) {
+            port_xy.push_back(xy(virt(core.x, core.y)));
+        }
+    }
     const uint32_t pct_wg = kLandGroup;
 
     tt::tt_metal::WorkloadDescriptor workload;
@@ -318,6 +324,11 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
 
         ProgramDescriptor desc;
         desc.cbs = ProgramDescriptor::CBDescriptors(cbs.begin(), cbs.end());
+        // (PZR, PZW: the ports' zero-gate go - ids 0 and 1, before the fabric connections take the next free ones)
+        for (uint32_t id = 0; id < 2; ++id) {
+            desc.semaphores.push_back(
+                tt::tt_metal::SemaphoreDescriptor{.id = id, .core_ranges = ports, .initial_value = 0});
+        }
 
         auto reader =
             kernel("tail_engine/tail_engine_reader.cpp", engine, dm(DataMovementProcessor::RISCV_0, NOC::NOC_0));
@@ -376,6 +387,12 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
                 }
                 b.append(gate);
                 b.push_back(static_cast<uint32_t>(cx == 0 && cy == 0));
+                if (cx == 0 && cy == 0) {  // (the zero gate's lead releases the port cores)
+                    b.push_back(static_cast<uint32_t>(port_xy.size()));
+                    b.append(port_xy);
+                } else {
+                    b.push_back(0u);
+                }
                 b.append(order);
                 reader.emplace_runtime_args(core, b);
 
@@ -388,7 +405,6 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
                 for (uint32_t x : {g.NTO, g.SHMAX, vx, vy, u32(virt(cx, (cy + PAIRS) % GY).y)}) {
                     n.push_back(x);
                 }
-                n.push_back(words);
                 n.push_back(g.nst[pp]);
                 n.push_back(g.nown[pp]);
                 n.append(order);
@@ -428,9 +444,7 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
                 ys.push_back(u32(virt(0, q + PAIRS * l).y));
             }
             KernelDescriptor::RTArgList pr;
-            pr.push_back(words);
             pr.push_back(static_cast<uint32_t>(sends.size()));
-            pr.push_back(epoch);
             for (const auto& u : sends) {
                 pr.push_back(u.part | index_of(order, u.pos) << 8);
             }
@@ -444,7 +458,6 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
             const CoreCoord peer_port = plan.ports.at({opposite(dd), l});
             const CoreCoord rc = send_ready ? virt(peer_port.x, peer_port.y) : virt(0, 0);
             KernelDescriptor::RTArgList ps;
-            ps.push_back(words);
             ps.push_back(ready);
             for (uint32_t x : {static_cast<uint32_t>(send_ready), u32(rc.x), u32(rc.y)}) {
                 ps.push_back(x);
@@ -480,10 +493,11 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::engine_workload(
         desc.kernels.push_back(std::move(compute));
         desc.kernels.push_back(std::move(port_reader));
         desc.kernels.push_back(std::move(port_writer));
-        for (uint32_t id = 0; id < 5; ++id) {  // SX, SFREE, SW, SG, SGO
+        for (uint32_t id = 0; id < 7; ++id) {  // SX, SFREE, SW, SG, SGO, SZ, SZGO
             desc.semaphores.push_back(
                 tt::tt_metal::SemaphoreDescriptor{.id = id, .core_ranges = engine, .initial_value = 0});
         }
+
         workload.programs.push_back({ttnn::MeshCoordinateRange(coord, coord), std::move(desc)});
     }
     return workload;
@@ -508,13 +522,17 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::a2a_workload(
     Buffer* se = args.shared_expert.has_value() ? args.shared_expert->buffer() : nullptr;
     Buffer* out = output.buffer();
     Buffer* z = args.staging->buffer();
-    Buffer* zr = args.words.buffer();
     Buffer* arr = args.arrival->buffer();
     Buffer* rdy = args.ready.buffer();
 
     auto virt = [&](const CoreCoord& c) { return mesh->worker_core_from_logical_core(c); };
     auto node = [&](uint32_t r, uint32_t c) { return mesh->get_fabric_node_id(ttnn::MeshCoordinate(r, c)); };
     const CoreRangeSet work = cells(plan.workers);
+    std::vector<uint32_t> worker_xy;  // (x | y << 16 each: the carrying ports release them once a call)
+    for (const auto& c : plan.workers) {
+        worker_xy.push_back(xy(virt(c)));
+    }
+    TT_FATAL(worker_xy.size() == g.NW, "fused_tail (a2a): {} workers, NW {}", worker_xy.size(), g.NW);
     const uint32_t W = g.W, has_se = se != nullptr ? 1u : 0u;
 
     tt::tt_metal::WorkloadDescriptor workload;
@@ -533,6 +551,9 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::a2a_workload(
         const CoreRangeSet pcrs = cells(port_list);
 
         ProgramDescriptor desc;
+        // (the z-ready words, a row tile's 16 B apart: this call's, zeroed by each carrying port - the first CB on the
+        // workers and the ports, so one address on all of them: a worker's get_write_ptr is the ports')
+        desc.cbs.push_back(cb(CB_A2A_ZR, work.merge(pcrs), 16 * g.RT, tt::DataFormat::UInt32, 16 * g.RT));
         // (every block W pages - the port's RP x GROUP: no block straddles a ring's end)
         desc.cbs.push_back(cb(CB_A2A_RM, work, ring_pages(2 * W, {W}) * kPage, bf16, kPage));
         desc.cbs.push_back(cb(CB_A2A_T, work, ring_pages(W, {W}) * kPage, bf16, kPage));
@@ -574,13 +595,13 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::a2a_workload(
             KernelDescriptor::RTArgList pr;
             pr.push_back(z);
             pr.push_back(g.NW);
-            pr.push_back(zr);
             for (uint32_t x : {g.RT, g.NTH, g.NTB, l, plan.num_links, static_cast<uint32_t>(ds.size())}) {
                 pr.push_back(x);
             }
             for (const auto& u : ds) {
                 pr.push_back(u.pos | u.part << 8);
             }
+            pr.append(worker_xy);  // (the workers it releases once its z-ready words are zeroed)
             preader.emplace_runtime_args(core, pr);
 
             const auto rs = sc.readies(port);
@@ -661,7 +682,6 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::a2a_workload(
             for (uint32_t x : {c0, g.RT, g.NTH, g.NTB, p}) {
                 wr.push_back(x);
             }
-            wr.push_back(zr);
             wr.push_back(static_cast<uint32_t>(pxy.size()));
             wr.append(pxy);
             wwriter.emplace_runtime_args(core, wr);
@@ -672,6 +692,8 @@ tt::tt_metal::WorkloadDescriptor fused_tail_factory_detail::a2a_workload(
         desc.kernels.push_back(std::move(wwriter));
         desc.kernels.push_back(std::move(preader));
         desc.kernels.push_back(std::move(psender));
+        desc.semaphores.push_back(
+            tt::tt_metal::SemaphoreDescriptor{.id = 0, .core_ranges = work, .initial_value = 0});  // (SZR)
         workload.programs.push_back({ttnn::MeshCoordinateRange(coord, coord), std::move(desc)});
     }
     return workload;

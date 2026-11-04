@@ -26,8 +26,10 @@ column's K ranges as one DRAM burst each).
 - ports (direction x link): the balanced ring / line all-gather, link l carrying K half l, straight into the next
   chip's landing slots; a fused increment a 3-column group's last share (its watcher counts the step landed for the
   group).
-- persistent (resources): `fused_tail/engine_words` (per-step counters that only count up, a call count),
-  `fused_tail/engine_ready` (the fence), `fused_tail/engine_port_epoch` (the ports' call counts).
+- persistent (resources): `fused_tail/engine_ready` (the fence) - nothing that grows with the rows. The per-step words
+  (landed, the row's shares, the E tiles) are a per-call CB right after the landing CB (one address on engine and port
+  cores), zeroed by every engine core at the call's start: a zero gate on the lead engine core releases the writers
+  and the ports (whose ready to the previous chip goes out only then) before anything writes or polls them.
 - no per-call L1 arena: the regions are program CBs. The landing CB is created first, on the
   engine and port cores, so it sits at one address on every core of every chip; kernels read the slot bases with
   `get_write_ptr`. The ring depth (`NSLOT`) is chosen from the free L1 when the plan is built (hashed).
@@ -36,9 +38,11 @@ column's K ranges as one DRAM burst each).
 Ethernet core):
 - worker: its tile columns of every own row tile: read row-major, tilize, + se, its own block's tiles straight into
   the output, the others into the staging buffer `z`, then +1 on every carrying port's z-ready word of that row tile.
+  The z-ready words are a per-call CB (the first on workers and ports: one address), zeroed by each carrying port,
+  which then releases every worker (a semaphore) before any counts a row tile in - no persistent word a row tile.
 - port: once a row tile's workers wrote it, its runs of every destination's block, multi-hop 2D unicast into the
   destination's output; a fused arrival increment every 8th run; ready / arrival fence, re-armed by the waiters.
-- persistent (resources): `fused_tail/a2a_zready`, `fused_tail/a2a_arrival`, `fused_tail/a2a_ready` (port cores),
+- persistent (resources): `fused_tail/a2a_arrival`, `fused_tail/a2a_ready` (port cores),
   `fused_tail/a2a_z` (DRAM staging).
 - ring ties (a destination half the ring away) follow the fabric (`get_eth_forwarding_direction`).
 

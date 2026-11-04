@@ -23,6 +23,16 @@ constexpr uint32_t PAIRS = get_compile_time_arg_val(6), WG = get_compile_time_ar
 // same address as on the engine cores, so its base is the landing slots' address on every engine core)
 constexpr uint32_t CBP = get_compile_time_arg_val(8), CBM = get_compile_time_arg_val(9);
 constexpr uint32_t CB_POLL = get_compile_time_arg_val(10), CB_LAND = get_compile_time_arg_val(11);
+// the engine's step words (this call's, CB_WD after the landing CB: one address on every engine and port core) and
+// the zero gate's go a port kernel waits for before it reads or writes any of them (tail_engine_common.hpp)
+constexpr uint32_t CB_WD = 16, PZR = 0, PZW = 1;
+// (the go: the engine's lead increments it once a call once every engine core zeroed its words; re-armed here)
+FORCE_INLINE void wait_zero_gate(uint32_t id) {
+    volatile tt_l1_ptr uint32_t* g = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(id));
+    noc_semaphore_wait_min(g, 1);
+    noc_semaphore_inc(get_noc_addr(get_semaphore(id)), 0u - 1u);
+    noc_async_atomic_barrier();
+}
 
 // the shares of a unit (block at chunk position pos on the chip that holds the slots), in the walk both kernels
 // follow: f(pair, step, cx, k0, t0, tiles, last); part 0 every column, 1 / 2 the first / second half of them

@@ -27,7 +27,35 @@ void kernel_main() {
     const uint32_t gw = get_arg_val<uint32_t>(a++), gx0 = get_arg_val<uint32_t>(a++), gy0 = get_arg_val<uint32_t>(a++);
     const uint32_t gx1 = get_arg_val<uint32_t>(a++), gy1 = get_arg_val<uint32_t>(a++), gn = get_arg_val<uint32_t>(a++);
     const uint32_t glead = get_arg_val<uint32_t>(a++);
-    const uint32_t ord = a;
+    const uint32_t npz = get_arg_val<uint32_t>(a++), pz = a;  // (the lead: the port cores it releases, x | y << 16)
+    const uint32_t ord = pz + npz;
+    {  // this call's step words zeroed here, then counted in on the lead; the lead releases the writers and the ports
+        DeviceZoneScopedN("TL-ZGATE");
+        volatile tt_l1_ptr uint32_t* wd = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(CB_WD));
+        for (uint32_t i = 0; i < WD_BYTES / 4; ++i) {
+            wd[i] = 0;
+        }
+        noc_semaphore_inc(get_noc_addr(gw & 0xFFFF, gw >> 16, get_semaphore(SZ)), 1);
+        if (glead) {
+            volatile tt_l1_ptr uint32_t* cnt = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(SZ));
+            noc_semaphore_wait(cnt, gn);
+            *cnt = 0;  // (re-arm: every core's one increment landed)
+            // (the go's source: the words' spare slot (kind 3, step 0), not my SZGO - my writer re-arms that one,
+            // possibly before the multicast has read it)
+            wd[4 * 3 * NSTMAX] = 1;
+            noc_semaphore_set_multicast_loopback_src(
+                reinterpret_cast<uint32_t>(wd + 4 * 3 * NSTMAX),
+                get_noc_multicast_addr(gx0, gy0, gx1, gy1, get_semaphore(SZGO)),
+                gn);
+            for (uint32_t i = 0; i < npz; ++i) {
+                const uint32_t xy = get_arg_val<uint32_t>(pz + i);
+                noc_semaphore_inc(get_noc_addr(xy & 0xFFFF, xy >> 16, get_semaphore(PZR)), 1);
+                noc_semaphore_inc(get_noc_addr(xy & 0xFFFF, xy >> 16, get_semaphore(PZW)), 1);
+            }
+            noc_async_write_barrier();
+            noc_async_atomic_barrier();
+        }
+    }
     const auto zg = TensorAccessor(z_args, z_addr, KT * 64);  // (a page: one latent row)
     const auto sg = TensorAccessor(s_args, se_addr, 2048);
     cb_reserve_back(CB_ONES, 1);  // (the all-ones tile of the squares' row sums)

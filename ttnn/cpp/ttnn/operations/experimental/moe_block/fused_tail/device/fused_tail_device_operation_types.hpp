@@ -48,10 +48,8 @@ struct FusedTailInputs {
     std::optional<Tensor> shared_expert;  // engine: [1, 1, S/SP, H/TP]; a2a: [1, 1, S/N, H] or none; TILE, DRAM
     std::optional<Tensor> w_up;           // engine: prepare_fused_tail_weights' W' (DRAM, bank-sharded regions)
     // The resources' persistent words (tensor args, so a cache hit rebinds their addresses)
-    Tensor ready{};                    // the fence's ready word on every port core
-    Tensor words{};                    // engine: the per-step counters (engine cores); a2a: z-ready words (ports)
-    std::optional<Tensor> port_epoch;  // engine: the ports' call counts
-    std::optional<Tensor> arrival;     // a2a: the ports' arrival counters
+    Tensor ready{};                 // the fence's ready word on every port core (the per-row-tile words are per-call CBs)
+    std::optional<Tensor> arrival;  // a2a: the ports' arrival counters
     std::optional<Tensor> staging;     // a2a: z [1, 1, S/N, H] TILE, DRAM (the blocks for other chips)
     std::optional<Tensor> output;      // preallocated output
 };

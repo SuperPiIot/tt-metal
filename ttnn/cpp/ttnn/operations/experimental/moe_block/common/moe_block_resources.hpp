@@ -126,6 +126,9 @@ public:
     bool frozen() const { return frozen_; }
     // Frees every buffer and plan; the object is unusable afterwards.
     void release();
+    // The words slab's bytes a core: its capacity, and the end of the furthest word set placed in it so far.
+    uint32_t words_slab_capacity() const { return words_slab_capacity_; }
+    uint32_t words_slab_used() const { return words_slab_used_; }
 
 private:
     MoEBlockResources(

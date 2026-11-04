@@ -77,7 +77,6 @@ void FusedTailDeviceOperation::validate_on_program_cache_miss(
         TT_FATAL(
             args.w_up->buffer() != nullptr && args.w_up->memory_config().buffer_type() == BufferType::DRAM,
             "fused_tail: w_up must be a DRAM tensor of prepare_fused_tail_weights");
-        TT_FATAL(args.port_epoch.has_value(), "fused_tail: the ports' call counts are missing");
     } else {
         TT_FATAL(attrs.a2a_plan != nullptr, "fused_tail: the a2a plan is missing");
         const auto& g = attrs.a2a_plan->geom;

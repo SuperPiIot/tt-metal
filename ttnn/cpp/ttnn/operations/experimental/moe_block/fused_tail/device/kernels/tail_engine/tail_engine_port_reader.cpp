@@ -11,11 +11,10 @@
 void kernel_main() {
     const uint32_t land = get_write_ptr(CB_LAND), poll = get_write_ptr(CB_POLL);
     size_t a = 0;
-    const uint32_t sl = get_arg_val<uint32_t>(a++);
-    const uint32_t n = get_arg_val<uint32_t>(a++), epa = get_arg_val<uint32_t>(a++);  // (my call count's word)
-    volatile tt_l1_ptr uint32_t* epw = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(epa);
-    const uint32_t ep = *epw + 1;
-    *epw = ep;
+    const uint32_t sl = get_write_ptr(CB_WD);  // (the owners' landed words: this call's)
+    const uint32_t n = get_arg_val<uint32_t>(a++);
+    constexpr uint32_t ep = 1;
+    wait_zero_gate(PZR);  // (the owners' words zeroed before I poll them)
     const uint32_t units = a, ak = units + n, xs = ak + 2 * GX, ys = xs + GX;  // (unit: part | position here << 8)
     volatile tt_l1_ptr uint32_t* pw = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(poll);
     // a group: PG packets' slots reserved, read, one barrier, pushed whole (padded) with its packet count in CBM - a

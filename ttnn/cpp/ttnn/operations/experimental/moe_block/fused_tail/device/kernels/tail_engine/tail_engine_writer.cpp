@@ -21,8 +21,7 @@ void kernel_main() {
     const uint32_t o_addr = get_arg_val<uint32_t>(a++), NTO = get_arg_val<uint32_t>(a++);
     const uint32_t SHMAX = get_arg_val<uint32_t>(a++);
     const uint32_t mx = get_arg_val<uint32_t>(a++), my = get_arg_val<uint32_t>(a++), py = get_arg_val<uint32_t>(a++);
-    const uint32_t words = get_arg_val<uint32_t>(a++), nst = get_arg_val<uint32_t>(a++),
-                   nown = get_arg_val<uint32_t>(a++);
+    const uint32_t words = get_write_ptr(CB_WD), nst = get_arg_val<uint32_t>(a++), nown = get_arg_val<uint32_t>(a++);
     const uint32_t ord = a, xs = ord + NCK,
                    wkb = xs + GX;  // (chunk order; my row's NoC x by column; W' K range bounds)
     // (the steps I watch: a landed row tile's last share is mine - its port's one fused increment, behind the row's
@@ -35,10 +34,15 @@ void kernel_main() {
     // the data - same NoC, same VC, so in order: no write barrier between, the chain's next core goes on seeing it)
     auto sa = [&](uint32_t s, uint32_t c) { return words + 16 * (3 * NSTMAX + 1 + s * GX + c); };
     auto sav = [&](uint32_t s, uint32_t c) { return reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sa(s, c)); };
-    volatile tt_l1_ptr uint32_t* epw = wv(3, 0);  // (my call count: this call's words are >= ep x their count)
-    const uint32_t ep = *epw + 1;
-    *epw = ep;
-    *wv(1, 0) = ep;  // (the shares' words' source)
+    {  // (this call's words zeroed on every engine core: the zero gate's go - TL-ZGATE)
+        volatile tt_l1_ptr uint32_t* go = sem(SZGO);
+        while (*go == 0) {
+            invalidate_l1_cache();
+        }
+        *go = 0;  // (re-arm: one set a call)
+    }
+    constexpr uint32_t ep = 1;  // (this call's words: a step's word reaches ep x its count)
+    *wv(1, 0) = ep;             // (the shares' words' source)
     const auto og = TensorAccessor(o_args, o_addr, 2048);
     auto row = [&](uint32_t addr) { return get_noc_multicast_addr(rx, my, lx, my, addr); };  // (NOC1: right end first)
     const uint32_t n = ak1 - ak0;

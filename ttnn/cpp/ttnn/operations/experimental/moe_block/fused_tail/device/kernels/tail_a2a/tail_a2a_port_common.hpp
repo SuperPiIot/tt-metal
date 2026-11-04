@@ -10,6 +10,8 @@
 #include "api/dataflow/dataflow_api.h"
 
 constexpr uint32_t CB = get_compile_time_arg_val(0), PB = get_compile_time_arg_val(1), RP = get_compile_time_arg_val(2);
+// (fused_tail_program_factory's A2ACb: the z-ready words' CB; the workers' zero-gate semaphore)
+constexpr uint32_t CB_ZR = 5, SZR = 0;
 constexpr uint32_t NB = get_compile_time_arg_val(3), GROUP = get_compile_time_arg_val(4),
                    INC = get_compile_time_arg_val(5);
 

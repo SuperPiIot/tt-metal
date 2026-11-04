@@ -99,12 +99,9 @@ Tensor fused_tail(
         params.kind = TailKind::Engine;
         params.nslot = g.NSLOT;
         params.engine_plan = plan;
-        // (the engine cores' per-step words - landed, the row's shares, the row's E tiles - their call count, and the
-        // shares' words: a column a step; the ports' ready and call count)
-        inputs.words = resources.persistent_words(
-            "fused_tail/engine_words", plan->engine_cores, 4 * (3 * g.NSTMAX + 1 + g.NSTMAX * g.GX));
+        // (the ports' ready: the fence's one persistent word - the engine's per-step words are a per-call CB, zeroed
+        // each call behind the engine's zero gate, so no L1_SMALL grows with the rows)
         inputs.ready = resources.persistent_words("fused_tail/engine_ready", plan->port_cores, 4);
-        inputs.port_epoch = resources.persistent_words("fused_tail/engine_port_epoch", plan->port_cores, 4);
     } else {
         TT_FATAL(!w_up.has_value(), "fused_tail: a model without a latent takes no w_up");
         const auto& plan = resources.plan<A2APlanPtr>("fused_tail/a2a_plan", [&] {
@@ -113,8 +110,7 @@ Tensor fused_tail(
         const auto& g = plan->geom;
         params.kind = TailKind::A2A;
         params.a2a_plan = plan;
-        // (the z-ready words: a row tile's, 16 B apart, on every port core; the fence's arrival and ready words)
-        inputs.words = resources.persistent_words("fused_tail/a2a_zready", plan->port_union, 4 * g.RT);
+        // (the fence's arrival and ready words; the z-ready words are a per-call CB on the ports)
         inputs.arrival = resources.persistent_words("fused_tail/a2a_arrival", plan->port_union, 4);
         inputs.ready = resources.persistent_words("fused_tail/a2a_ready", plan->port_union, 4);
         inputs.staging = resources.persistent_tensor(

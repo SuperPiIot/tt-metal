@@ -16,7 +16,9 @@ using namespace tt::tt_fabric;
 void kernel_main() {
     const uint32_t land = get_write_ptr(CB_LAND);
     size_t a = 0;
-    const uint32_t sl = get_arg_val<uint32_t>(a++), ready = get_arg_val<uint32_t>(a++);
+    const uint32_t sl = get_write_ptr(CB_WD), ready = get_arg_val<uint32_t>(a++);  // (the next chip's landed words)
+    // (this chip's engine words zeroed before my ready goes out: the previous chip's fused increments land in them)
+    wait_zero_gate(PZW);
     const uint32_t send_ready = get_arg_val<uint32_t>(a++), rx = get_arg_val<uint32_t>(a++),
                    ry = get_arg_val<uint32_t>(a++);
     const uint16_t mesh_id = get_arg_val<uint32_t>(a++), chip_id = get_arg_val<uint32_t>(a++);
@@ -29,7 +31,7 @@ void kernel_main() {
     volatile tt_l1_ptr PACKET_HEADER_TYPE* hdr = PacketHeaderPool::allocate_header();
     (void)fabric_set_unicast_route(hdr, chip_id, mesh_id);
     conn.open();
-    if (send_ready) {  // (this program runs: everything before it on this chip is done - my landing regions are free)
+    if (send_ready) {  // (this program runs and its engine words are zeroed - my landing regions are free)
         hdr->to_noc_unicast_atomic_inc(NocUnicastAtomicIncCommandHeader{get_noc_addr(rx, ry, ready), 1, true});
         conn.wait_for_empty_write_slot();
         conn.send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(hdr), sizeof(PACKET_HEADER_TYPE));

@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // TailA2A port reader (RISCV_1, NoC0): my runs of every destination, row tile by row tile, from the staging buffer z
-// once its workers wrote the row tile.
+// once its workers wrote the row tile. The z-ready words (a row tile's, 16 B apart) are this call's: CB_ZR, the first
+// CB on the workers and the ports (one address on all of them), zeroed here, then every worker released (its zero
+// gate semaphore) before any of them counts a row tile in.
 
 #include "tail_a2a_port_common.hpp"
 
@@ -11,14 +13,21 @@ void kernel_main() {
     constexpr auto z_args = TensorAccessorArgs<6>();
     size_t a = 0;
     const uint32_t z_addr = get_arg_val<uint32_t>(a++), NW = get_arg_val<uint32_t>(a++);
-    const uint32_t zr_addr = get_arg_val<uint32_t>(a++), RT = get_arg_val<uint32_t>(a++);
+    const uint32_t zr_addr = get_write_ptr(CB_ZR), RT = get_arg_val<uint32_t>(a++);
     const uint32_t NTH = get_arg_val<uint32_t>(a++), NTB = get_arg_val<uint32_t>(a++);
     const uint32_t l = get_arg_val<uint32_t>(a++), L = get_arg_val<uint32_t>(a++), nd = get_arg_val<uint32_t>(a++);
-    const uint32_t d0 = a;
+    const uint32_t d0 = a, w0 = d0 + nd;  // (my destinations, then my workers' x | y << 16, NW of them)
     const auto z = TensorAccessor(z_args, z_addr, PB);
     volatile tt_l1_ptr uint32_t* zr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zr_addr);
     if (nd == 0) {
-        return;
+        return;  // (not a carrying port: no worker counts in here)
+    }
+    for (uint32_t r = 0; r < RT; ++r) {
+        zr[4 * r] = 0;
+    }
+    for (uint32_t w = 0; w < NW; ++w) {
+        const uint32_t xy = get_arg_val<uint32_t>(w0 + w);
+        noc_semaphore_inc(get_noc_addr(xy & 0xFFFF, xy >> 16, get_semaphore(SZR)), 1);
     }
     uint32_t batch = 0, wptr = 0;
     for (uint32_t r = 0; r < RT; ++r) {
@@ -45,9 +54,6 @@ void kernel_main() {
     if (batch) {
         noc_async_read_barrier();
         cb_push_back(CB, RP * batch);
-    }
-    for (uint32_t r = 0; r < RT; ++r) {  // (re-arm: every increment of the call landed)
-        noc_semaphore_inc(get_noc_addr(zr_addr + 16 * r), 0u - NW);
     }
     noc_async_atomic_barrier();
 }

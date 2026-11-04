@@ -171,6 +171,11 @@ void bind_resources(nb::module_& mod) {
         .def_prop_ro("dtypes", [](const MoEBlockResources& r) { return r.dtypes(); })
         .def_prop_ro("dims", [](const MoEBlockResources& r) { return r.dims(); })
         .def_prop_ro(
+            "words_slab_used",
+            &MoEBlockResources::words_slab_used,
+            "The persistent words slab's bytes a core taken so far (the furthest word set's end)")
+        .def_prop_ro("words_slab_capacity", &MoEBlockResources::words_slab_capacity)
+        .def_prop_ro(
             "topology",
             [](const MoEBlockResources& r) {
                 const auto& t = r.topology();
