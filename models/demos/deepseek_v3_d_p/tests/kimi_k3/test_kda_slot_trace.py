@@ -30,7 +30,7 @@ from models.demos.deepseek_v3_d_p.tt.kda.state_adapter import (
     device_scalar,
 )
 from models.demos.deepseek_v3_d_p.tt.kimi_k3.attention import K3AttnContext, TtK3KdaAttention
-from tests.ttnn.unit_tests.operations.experimental.kda.kda_test_utils import assert_bit_identical
+from tt_py_test_utils_common.kda_test_utils import assert_bit_identical
 
 pytestmark = run_for_blackhole()
 
