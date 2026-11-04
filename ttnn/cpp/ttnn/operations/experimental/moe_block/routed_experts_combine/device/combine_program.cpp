@@ -5,6 +5,7 @@
 #include "combine_program.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 
 #include <tt-metalium/circular_buffer_constants.h>
@@ -166,7 +167,16 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
         }
     }
     const auto au = combine_auto(
-        N, in.S, in.W, pool.size(), n_ports, in.arena_bytes, in.depth, in.n_acc.value_or(kAccMax), in.mode);
+        N,
+        in.S,
+        in.W,
+        pool.size(),
+        n_ports,
+        in.arena_bytes,
+        in.depth,
+        in.n_acc.value_or(kAccMax),
+        in.mode,
+        in.landing.value_or(CombineLanding::Rings));
     TT_FATAL(
         au.fits,
         "routed_experts_combine: does not fit ({} cells, {} KB): {}",
@@ -181,6 +191,7 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     plan->choice = *au.best;
     plan->fused = au.best->acc_on_ports;
     plan->perchip = !plan->fused;
+    plan->shared = au.best->shared;
     const uint32_t n_acc = au.best->n_acc;
 
     // ports and accumulators (sparse_combine_rf_prepare)
@@ -258,14 +269,17 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     }
 
     // the layout (the arena budget's sizing, as sparse_combine_rf_prepare)
-    plan->st = state_layout(N, A);
+    plan->st = state_layout(N, A, plan->shared ? kGrants : 0);
     const uint32_t SLOT = plan->pc.slot, ISLOT = SLOT;
     const uint32_t acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT);
     const uint32_t QP0 = au.best->inj_slots, keep_slots = au.best->local_keep;
     const int64_t keep = plan->fused ? static_cast<int64_t>(keep_slots + std::min(32u, QP0)) * ISLOT
                                      : static_cast<int64_t>(keep_slots) * ISLOT;
     const int64_t fit = (static_cast<int64_t>(in.arena_bytes) - plan->st.RINGS - acc_cbs - keep) / SLOT;
-    const int64_t PSL = std::min<int64_t>(static_cast<int64_t>(in.depth) * (N - 1), fit);
+    const int64_t PSL = std::min<int64_t>(
+        {static_cast<int64_t>(in.depth) * (N - 1),
+         fit,
+         plan->shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
     TT_FATAL(
         PSL >= static_cast<int64_t>(N) - 1, "routed_experts_combine: no room for one landing slot per source chip");
     TT_FATAL(PSL < 4096, "routed_experts_combine: a ring's base / depth are 12-bit fields");
@@ -521,6 +535,12 @@ CombineHandles add_combine_program(
         if (plan.perchip) {
             defs["REC_ACC_LUT"] = "1";
         }
+        if (plan.shared) {  // (the shared landing's grant rings)
+            defs["REC_SHARED"] = "1";
+            defs["REC_G"] = std::to_string(st.G);
+            defs["REC_GIDH"] = std::to_string(st.GIDH);
+            defs["REC_GREC"] = std::to_string(st.GREC);
+        }
         accessor(ct, defs, "CMB_PLAN_CT", CombineBuf::Plan);
         accessor(ct, defs, "CMB_HC_CT", CombineBuf::Hcache);
         if (plan.perchip) {
@@ -627,6 +647,11 @@ CombineHandles add_combine_program(
             words_off,
             r_slot};
         std::map<std::string, std::string> rd_defs;
+        if (plan.shared) {
+            rd_defs["REC_SHARED"] = "1";
+            rd_defs["REC_G"] = std::to_string(st.G);
+            rd_defs["REC_GIDH"] = std::to_string(st.GIDH);
+        }
         accessor(rd_ct, rd_defs, "CMB_PLAN_CT", CombineBuf::Plan);
         const auto rd =
             dm_kernel(program, "dataflow/accumulator_reader.cpp", aset, std::move(rd_ct), r_riscv0, std::move(rd_defs));

@@ -5,6 +5,7 @@
 #include "combine_host.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <tuple>
 
@@ -21,10 +22,11 @@ RowSlot row_slot(uint32_t W) {
     return p;
 }
 
-StateLayout state_layout(uint32_t N, uint32_t A) {
+StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G) {
     const uint32_t AP = (A + 3) / 4 * 4;
     const uint32_t rw = align64(4ull * N * AP);
     StateLayout s;
+    s.G = G;
     s.CRED = 0;
     s.USED = rw;
     s.RET = 2 * rw;
@@ -32,9 +34,14 @@ StateLayout state_layout(uint32_t N, uint32_t A) {
     s.LAYO = 4 * rw;
     s.U0 = 5 * rw;
     s.CNT = 6 * rw;
+    if (G) {  // (shared landing: the grant rings, before the counts)
+        s.GIDH = s.CNT;
+        s.GREC = align64(s.GIDH + 4ull * N * AP * G);
+        s.CNT = align64(s.GREC + 4ull * N * AP * (1 + G));
+    }
     s.MISC = s.CNT + 512;
     s.HDRS = s.MISC + kMiscBytes;
-    s.RINGS = align64(s.HDRS + N * kNumHeaders * kHeaderStride + kNumHeaders * 4 * AP);
+    s.RINGS = align64(s.HDRS + N * kNumHeaders * kHeaderStride + kNumHeaders * 4 * AP * (1 + G));
     return s;
 }
 
@@ -53,10 +60,11 @@ CombineLayout combine_l1_layout(
     bool acc_on_ports,
     uint32_t inj_slots,
     uint32_t depth,
-    uint32_t local_keep) {
+    uint32_t local_keep,
+    bool shared) {
     const auto pc = row_slot(W);
     const int64_t ISLOT = pc.slot, SLOT = pc.slot;
-    const int64_t RINGS = state_layout(N, A).RINGS;
+    const int64_t RINGS = state_layout(N, A, shared ? kGrants : 0).RINGS;
     const uint32_t MAXT = (S + A - 1) / A;
     CombineLayout out;
     out.slot = pc.slot;
@@ -74,7 +82,11 @@ CombineLayout combine_l1_layout(
     // (Python floor division: a negative budget floors toward -inf)
     auto fdiv = [](int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
     const int64_t fit = fdiv(arena - RINGS - acc_cbs - keep, SLOT);
-    const int64_t PSL = std::min<int64_t>(static_cast<int64_t>(depth) * (N - 1), fit);
+    if (shared && acc_on_ports) {
+        return fail("shared landing: the accumulators apart from the ports only");
+    }
+    const int64_t PSL = std::min<int64_t>(
+        {static_cast<int64_t>(depth) * (N - 1), fit, shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
     out.PSL = static_cast<int32_t>(PSL);
     out.D = N > 1 ? static_cast<int32_t>(fdiv(PSL, N - 1)) : 0;
     out.has_PSL = true;
@@ -123,7 +135,9 @@ CombineAuto combine_auto(
     uint32_t arena_bytes,
     uint32_t depth,
     uint32_t a_max,
-    std::optional<CombineMode> mode) {
+    std::optional<CombineMode> mode,
+    CombineLanding landing) {
+    const bool shared = landing == CombineLanding::Shared;
     CombineAuto res;
     std::vector<std::string> why;
     auto score = [](const CombineAutoChoice& c) {
@@ -136,6 +150,10 @@ CombineAuto combine_auto(
         if (mode.has_value() && *mode != (fused ? CombineMode::AccOnPorts : CombineMode::PortsApart)) {
             continue;
         }
+        if (shared && fused) {  // (shared landing: the accumulators apart from the ports only)
+            why.push_back(fmt::format("{}: not with the shared landing", name));
+            continue;
+        }
         if (A < 1 || (fused && static_cast<int64_t>(port_cells) > A)) {
             why.push_back(fmt::format("{}: {} accumulator cells", name, A));
             continue;
@@ -144,12 +162,13 @@ CombineAuto combine_auto(
         CombineLayout last;
         for (const uint32_t keep : {8u, 2u}) {
             for (const uint32_t qp : {64u, 32u, 16u, 8u}) {
-                auto lay = combine_l1_layout(N, S, W, static_cast<uint32_t>(A), arena_bytes, fused, qp, depth, keep);
+                auto lay =
+                    combine_l1_layout(N, S, W, static_cast<uint32_t>(A), arena_bytes, fused, qp, depth, keep, shared);
                 if (!lay.fits) {
                     last = lay;
                     continue;
                 }
-                CombineAutoChoice cand{fused, static_cast<uint32_t>(A), qp, depth, keep, lay};
+                CombineAutoChoice cand{fused, static_cast<uint32_t>(A), qp, depth, keep, shared, lay};
                 if (!mode_best || score(cand) > score(*mode_best)) {
                     mode_best = cand;
                 }

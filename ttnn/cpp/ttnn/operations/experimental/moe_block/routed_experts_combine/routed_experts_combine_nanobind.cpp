@@ -50,6 +50,7 @@ nb::dict choice_dict(const CombineAutoChoice& c) {
     d["inj_slots"] = c.inj_slots;
     d["depth"] = c.depth;
     d["local_keep"] = c.local_keep;
+    d["shared"] = c.shared;
     d["layout"] = layout_dict(c.layout);
     return d;
 }
@@ -60,19 +61,22 @@ void bind_routed_experts_combine(nb::module_& mod) {
     using namespace routed_experts_combine_nanobind_detail;
 
     export_enum<CombineMode>(mod, "CombineMode");
+    export_enum<CombineLanding>(mod, "CombineLanding");
 
     nb::class_<CombineConfig> cfg(mod, "CombineConfig", R"doc(
         The combine's op-specific configuration (combine_snap comes from MoEBlockConfig). n_acc / mode pin the
         accumulator count and mode the fused head planned; arena_bytes is the combine's L1 budget a core (0: the
         exchange's sizing from the largest free L1 block at the first call, less the flat program's static CBs and the
-        dispatch's); depth is the landing pool's slots per source chip. A row travels as one fabric packet with its
-        32 B trailer.
+        dispatch's); depth is the landing pool's slots per source chip; landing: a CombineLanding (Rings: one ring a
+        source chip; Shared: slot grants from one free list, accumulators apart from the ports), None the planner's
+        (rings). A row travels as one fabric packet with its 32 B trailer.
     )doc");
     cfg.def(nb::init<>())
         .def_rw("n_acc", &CombineConfig::n_acc)
         .def_rw("mode", &CombineConfig::mode)
         .def_rw("arena_bytes", &CombineConfig::arena_bytes)
         .def_rw("depth", &CombineConfig::depth)
+        .def_rw("landing", &CombineConfig::landing)
         .def(nb::self == nb::self);
 
     ttnn::bind_function<"routed_experts_combine", "ttnn.experimental.moe_block.">(
@@ -156,8 +160,9 @@ void bind_routed_experts_combine(nb::module_& mod) {
            uint32_t arena_bytes,
            uint32_t depth,
            uint32_t a_max,
-           std::optional<CombineMode> mode) {
-            const auto r = combine_auto(N, S, W, n_cells, port_cells, arena_bytes, depth, a_max, mode);
+           std::optional<CombineMode> mode,
+           CombineLanding landing) {
+            const auto r = combine_auto(N, S, W, n_cells, port_cells, arena_bytes, depth, a_max, mode, landing);
             nb::dict modes;
             if (r.ports_apart) {
                 modes["ports apart"] = choice_dict(*r.ports_apart);
@@ -183,6 +188,7 @@ void bind_routed_experts_combine(nb::module_& mod) {
         nb::arg("depth") = 8,
         nb::arg("a_max") = kAccMax,
         nb::arg("mode").none() = nb::none(),
+        nb::arg("landing") = CombineLanding::Rings,
         "The combine's automatic configuration as a dict (mode: a CombineMode, or none for the best).");
     mod.def(
         "combine_credit_policy",
@@ -211,6 +217,8 @@ void bind_routed_experts_combine(nb::module_& mod) {
             d["QP"] = l1.plan->QP;
             d["QL"] = l1.plan->QL;
             d["acc_on_ports"] = l1.plan->fused;
+            d["shared"] = l1.plan->shared;
+            d["PSL"] = l1.plan->PSL;
             return d;
         },
         nb::arg("resources"),

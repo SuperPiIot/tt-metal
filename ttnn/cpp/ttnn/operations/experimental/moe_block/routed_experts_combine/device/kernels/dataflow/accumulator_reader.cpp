@@ -6,6 +6,10 @@
 // call's count in the device plan); a consumed slot is one credit, counted on the port that faces the row's source on
 // this accumulator's link to it (that port sends the credits back). Each row goes to the compute with its gate weight.
 // It also zeroes this core's state for the call (combine_zero_gate.hpp); accumulator 0's reader is its chip's gate.
+// REC_SHARED (the shared landing pool): no rings - the pool's slots granted to sources by id (REC_G grants outstanding a
+// source at most), each grant written into the home port's grant ring (REC_GIDH: per (source, accumulator) G words,
+// slot | tag << 24) and counted (RET / MRTOT, as the credits are with rings): the port forwards them in its snapshots.
+// Taken slots go back on the free list and to the sources with rows still to grant.
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -33,6 +37,13 @@ constexpr uint32_t WORDS_OFF = get_compile_time_arg_val(20);
 constexpr uint32_t BAR_SLOT = get_compile_time_arg_val(21);
 constexpr auto plan_args = TensorAccessorArgs<CMB_PLAN_CT>();  // (the device plan)
 constexpr uint32_t LASTPB = row_bytes;  // the row's 32 B trailer (one fabric packet a row)
+#ifdef REC_SHARED
+constexpr uint32_t SHARED = 1, G = REC_G, GIDH = REC_GIDH;
+static_assert(PSL <= 254, "shared landing: slot owners are bytes (0xFF: free)");
+#else
+constexpr uint32_t SHARED = 0, G = 1, GIDH = 0;
+#endif
+#define GTAG(q) (0x80u | ((q) & 0x7Fu))  // (a grant's tag: never 0 - a zeroed ring entry is no grant)
 
 void kernel_main() {
     size_t a = 0;
@@ -66,9 +77,9 @@ void kernel_main() {
     const uint32_t LB = area + LOC_OFF, lwords = area + WORDS_OFF;
     const uint32_t wa = a;  // (the y writers' x, y)
     cb_reserve_back(cb_tab, 1);
+    const uint32_t sc = (get_write_ptr(cb_tab) + 63) & ~63u;  // (CB_TAB: scratch - the plan's words, the free list)
     uint32_t n_local = 0;
     {  // (the device plan: n_local and want[] of this accumulator)
-        const uint32_t sc = (get_write_ptr(cb_tab) + 63) & ~63u;
         const uint64_t plan_noc = TensorAccessor(plan_args, plan, 4096).get_noc_addr(0);
         noc_async_read(plan_noc + 64, sc, 64);                        // n_local[16]
         noc_async_read(plan_noc + (32 + me * 32) * 4, sc + 64, 128);  // want[me][32]
@@ -130,16 +141,77 @@ void kernel_main() {
         }
         uint32_t b = 0;
         for (uint32_t k = 0; k < N; ++k) {
-            const uint32_t d = rdep[k] < want[k] ? rdep[k] : want[k];  // (no more slots than rows)
+            uint32_t d = rdep[k] < want[k] ? rdep[k] : want[k];  // (no more slots than rows)
+            if constexpr (SHARED) {
+                d = d < G ? d : G;  // (the first grants: the carve's shares, G at most)
+            }
             rbase[k] = b;
             rdep[k] = d;
             b += d;
             t0[k] = taken[k];
-            if (k != hc && px[k]) {
-                noc_inline_dw_write(
-                    get_noc_addr(px[k], py[k], area + LAYO + 4 * (k * AP + me)), tag << 24 | rbase[k] << 12 | d);
+            if constexpr (!SHARED) {
+                if (k != hc && px[k]) {
+                    noc_inline_dw_write(
+                        get_noc_addr(px[k], py[k], area + LAYO + 4 * (k * AP + me)), tag << 24 | rbase[k] << 12 | d);
+                }
             }
         }
+    }
+    // shared: each slot's owner (source, 0xFF free) and the free list in CB_TAB's scratch past the plan's words; per
+    // source the grants outstanding and issued this call
+    volatile tt_l1_ptr uint8_t* own = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(sc + 256);
+    volatile tt_l1_ptr uint16_t* fstack = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 512);
+    uint32_t gout[N], giss[N], nfree = 0;
+    auto grant = [&](uint32_t k, uint32_t slot) {  // (the id into the home port's grant ring, then its count)
+        const uint32_t seq = t0[k] + giss[k];
+        noc_inline_dw_write(
+            get_noc_addr(px[k], py[k], area + GIDH + 4 * ((k * AP + me) * G + seq % G)), slot | GTAG(seq) << 24);
+        noc_semaphore_inc(get_noc_addr(px[k], py[k], area + RET + 4 * (k * AP + me)), 1);
+        noc_semaphore_inc(get_noc_addr(px[k], py[k], area + MISC + 4 * (MRTOT + k)), 1);
+        own[slot] = static_cast<uint8_t>(k);
+        ++giss[k];
+        ++gout[k];
+    };
+    // a freed slot to the source with rows still to grant (want - outstanding), fewest outstanding first
+    auto regrant = [&]() {
+        while (nfree) {
+            uint32_t bk = N;
+            for (uint32_t k = 0; k < N; ++k) {
+                if (k == hc || gout[k] >= G || want[k] <= gout[k]) {
+                    continue;
+                }
+                if (bk == N || gout[k] < gout[bk] ||
+                    (gout[k] == gout[bk] && want[k] - gout[k] > want[bk] - gout[bk])) {
+                    bk = k;
+                }
+            }
+            if (bk == N) {
+                return;
+            }
+            grant(bk, fstack[--nfree]);
+        }
+    };
+    if constexpr (SHARED) {
+        for (uint32_t i = 0; i < PSL; ++i) {
+            own[i] = 0xFF;
+        }
+        for (uint32_t k = 0; k < N; ++k) {
+            gout[k] = giss[k] = 0;
+        }
+        for (uint32_t k = 0; k < N; ++k) {
+            if (k == hc || !px[k]) {
+                continue;
+            }
+            for (uint32_t j = 0; j < rdep[k]; ++j) {
+                grant(k, rbase[k] + j);
+            }
+        }
+        for (uint32_t i = PSL; i-- > 0;) {
+            if (own[i] == 0xFF) {
+                fstack[nfree++] = static_cast<uint16_t>(i);
+            }
+        }
+        regrant();  // (the slots the first grants left: to whoever has rows still to grant)
     }
     auto ring_slot = [&](uint32_t k, uint32_t tk) { return area + RINGS + (rbase[k] + (tk - t0[k]) % rdep[k]) * SLOT; };
     auto push_row = [&](uint32_t slot, uint32_t t) {  // a row: its gate weight (element 0), the row into the CB
@@ -210,6 +282,24 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(px[k], py[k], area + MISC + 4 * (MRTOT + k)), 1);
         return true;
     };
+    auto take_slot = [&](uint32_t i) -> bool {  // shared: slot i's row, if it landed
+        const uint32_t s = area + RINGS + i * SLOT;
+        volatile tt_l1_ptr uint32_t* tr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(s + LASTPB);
+        if (tr[3] == 0 || tr[7] == 0) {
+            return false;
+        }
+        push_row(s, (tr[0] >> 8) & 0xFFFF);
+        tr[3] = 0;
+        tr[7] = 0;
+        const uint32_t k = own[i];
+        own[i] = 0xFF;
+        fstack[nfree++] = static_cast<uint16_t>(i);
+        taken[k] = taken[k] + 1;
+        --want[k];
+        --gout[k];
+        ++done;
+        return true;
+    };
     while (done < n_rows) {
         invalidate_l1_cache();
         while (li < n_local) {
@@ -217,9 +307,21 @@ void kernel_main() {
                 break;
             }
         }
-        for (uint32_t k = 0; k < N; ++k) {
-            if (want[k]) {
-                take_ring(k);
+        if constexpr (SHARED) {  // (every granted slot, in any order; freed slots granted again at once)
+            bool any = false;
+            for (uint32_t i = 0; i < PSL; ++i) {
+                if (own[i] != 0xFF) {
+                    any = take_slot(i) || any;
+                }
+            }
+            if (any) {
+                regrant();
+            }
+        } else {
+            for (uint32_t k = 0; k < N; ++k) {
+                if (want[k]) {
+                    take_ring(k);
+                }
             }
         }
     }

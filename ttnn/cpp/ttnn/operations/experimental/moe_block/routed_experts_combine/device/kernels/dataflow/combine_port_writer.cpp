@@ -7,7 +7,8 @@
 // from the sources whose first hop back is this port, and forwards those sources their rings' layouts for the call.
 // Defines: REC_FUSED (a port that is also an
 // accumulator, acc_on_ports: this RISC also runs the port's L1 hand-off and the accumulator's output writes),
-// REC_ACC_LUT (per-chip roles: a home chip's accumulator cells from a DRAM table).
+// REC_ACC_LUT (per-chip roles: a home chip's accumulator cells from a DRAM table), REC_SHARED (the shared landing pool:
+// slot grants instead of rings - REC_G, REC_GIDH, REC_GREC).
 
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
@@ -53,6 +54,18 @@ constexpr uint32_t ZERO = get_compile_time_arg_val(25);  // 1: this kernel zeroe
 constexpr uint32_t WORDS_OFF = get_compile_time_arg_val(26);
 constexpr uint32_t LUT_OFF = get_compile_time_arg_val(27);
 constexpr uint32_t LUT_BYTES = get_compile_time_arg_val(28);
+// shared landing: a home's accumulators grant slot ids (GIDH at this port, per (source, accumulator) G words, id |
+// tag << 24; RET counts them) and this port forwards each source a snapshot of its validated grant counts and ids
+// (GREC at the source's port, per home: AP counts then AP x G ids); a row goes into its grant's slot. Grants replace
+// the rings' credits and layouts: no layout packets, no credits on consumption (a slot is granted again only after its
+// accumulator took its row).
+#ifdef REC_SHARED
+constexpr uint32_t SHARED = 1, G = REC_G, GIDH = REC_GIDH, GREC = REC_GREC;
+#else
+constexpr uint32_t SHARED = 0, G = 1, GIDH = 0, GREC = 0;
+#endif
+constexpr uint32_t SNAPW = SHARED ? AP * (1 + G) : AP;  // (a snapshot's words)
+#define GTAG(q) (0x80u | ((q) & 0x7Fu))                // (a grant's tag: never 0 - a zeroed entry is no grant)
 #ifdef REC_FUSED
 constexpr uint32_t cb_out = get_compile_time_arg_val(29);
 constexpr uint32_t NT_ = get_compile_time_arg_val(30);
@@ -251,14 +264,18 @@ void kernel_main() {
     misc[104] = calls_;
     const uint32_t tag = (calls_ - 1) % 255 + 1;
     uint32_t lay_pend = 0;  // (sources whose layouts this port still forwards: bit s)
-    for (uint32_t ci = 0; ci < N * AP; ++ci) {
-        u0[ci] = used[ci];
-    }
-    for (uint32_t s = 0; s < N; ++s) {
-        if (sx[s]) {
-            lay_pend |= 1u << s;
+    if constexpr (!SHARED) {  // (shared: U0 holds the grant counts validated and forwarded, from 0 a call)
+        for (uint32_t ci = 0; ci < N * AP; ++ci) {
+            u0[ci] = used[ci];
+        }
+        for (uint32_t s = 0; s < N; ++s) {
+            if (sx[s]) {
+                lay_pend |= 1u << s;
+            }
         }
     }
+    volatile tt_l1_ptr uint32_t* gidh = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(area + GIDH);
+    volatile tt_l1_ptr uint32_t* grec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(area + GREC);
     uint32_t inj_done = 0, sent = 0, pend_inj = 0, unflushed = 0;
 
     auto flush = [&]() {
@@ -303,18 +320,37 @@ void kernel_main() {
                 flush();
             }
             const uint32_t rot = sent % NH;
-            volatile tt_l1_ptr uint32_t* st = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cstage + rot * 4 * AP);
+            volatile tt_l1_ptr uint32_t* st = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cstage + rot * 4 * SNAPW);
             uint32_t cov = 0;
             for (uint32_t o = 0; o < A; ++o) {
-                const uint32_t v = ret[s * AP + o];
+                uint32_t v = ret[s * AP + o];
+                if constexpr (SHARED) {  // (a grant counts only once its id has landed here: its tag)
+                    const uint32_t gb = (s * AP + o) * G;
+                    uint32_t w = u0[s * AP + o];
+                    while (w != v && (gidh[gb + w % G] >> 24) == GTAG(w)) {
+                        ++w;
+                    }
+                    u0[s * AP + o] = w;
+                    v = w;
+                    for (uint32_t j = 0; j < G; ++j) {
+                        st[AP + o * G + j] = gidh[gb + j];
+                    }
+                }
                 st[o] = v;
                 cov += v;
             }
+            if constexpr (SHARED) {
+                if (cov == rdone[s]) {
+                    continue;  // (no grant validated yet: later)
+                }
+            }
             auto* h = hdr_at(s, rot);
             h->to_noc_unicast_write(
-                NocUnicastCommandHeader{get_noc_addr(sx[s], sy[s], area + CRED + 4 * me * AP)}, 4 * AP);
+                NocUnicastCommandHeader{
+                    get_noc_addr(sx[s], sy[s], SHARED ? area + GREC + 4 * me * SNAPW : area + CRED + 4 * me * AP)},
+                4 * SNAPW);
             conn.wait_for_empty_write_slot();
-            conn.send_current_slot_non_blocking(cstage + rot * 4 * AP, 4 * AP, reinterpret_cast<uint32_t>(h));
+            conn.send_current_slot_non_blocking(cstage + rot * 4 * SNAPW, 4 * SNAPW, reinterpret_cast<uint32_t>(h));
             ++sent;
             ++unflushed;
             returned += cov - rdone[s];
@@ -340,7 +376,7 @@ void kernel_main() {
                 flush();
             }
             const uint32_t rot = sent % NH;
-            volatile tt_l1_ptr uint32_t* st = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cstage + rot * 4 * AP);
+            volatile tt_l1_ptr uint32_t* st = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cstage + rot * 4 * SNAPW);
             for (uint32_t o = 0; o < A; ++o) {
                 st[o] = lay_o[s * AP + o];
             }
@@ -348,7 +384,7 @@ void kernel_main() {
             h->to_noc_unicast_write(
                 NocUnicastCommandHeader{get_noc_addr(sx[s], sy[s], area + LAYR + 4 * me * AP)}, 4 * AP);
             conn.wait_for_empty_write_slot();
-            conn.send_current_slot_non_blocking(cstage + rot * 4 * AP, 4 * AP, reinterpret_cast<uint32_t>(h));
+            conn.send_current_slot_non_blocking(cstage + rot * 4 * SNAPW, 4 * AP, reinterpret_cast<uint32_t>(h));
             ++sent;
             ++unflushed;
             lay_pend &= ~(1u << s);
@@ -361,19 +397,32 @@ void kernel_main() {
         }
         return t;
     };
-    // one row (one packet with its trailer, the header word at LASTPB) from L1 src to its home's ring; false: not yet
-    // (the ring's layout has not arrived, or the ring is full)
+    // one row (one packet with its trailer, the header word at LASTPB) from L1 src to its home's ring (shared: its
+    // grant's slot); false: not yet (the ring's layout has not arrived, or the ring is full; shared: no grant yet)
     auto send_row = [&](uint32_t src) -> bool {
         const uint32_t hdr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src + LASTPB)[0];
         const uint32_t home = hdr & 0xFF, t = (hdr >> 8) & 0xFFFF, o = t % A, ci = home * AP + o;
-        const uint32_t u = used[ci], lw = lay_r[ci], dep = lw & 0xFFF;
-        if ((lw >> 24) != tag) {
-            return false;
+        const uint32_t u = used[ci];
+        uint32_t dst;
+        if constexpr (SHARED) {  // (my u-th row to this accumulator: grant u's slot, once its id carries u's tag)
+            if (static_cast<int32_t>(grec[home * SNAPW + o] - u) < 1) {
+                return false;
+            }
+            const uint32_t gw = grec[home * SNAPW + AP + o * G + u % G];
+            if ((gw >> 24) != GTAG(u)) {
+                return false;
+            }
+            dst = area + RINGS + (gw & 0xFFFF) * SLOT;
+        } else {
+            const uint32_t lw = lay_r[ci], dep = lw & 0xFFF;
+            if ((lw >> 24) != tag) {
+                return false;
+            }
+            if (dep + cred[ci] - u < 1) {
+                return false;
+            }
+            dst = area + RINGS + (((lw >> 12) & 0xFFF) + (u - u0[ci]) % dep) * SLOT;  // (my ring)
         }
-        if (dep + cred[ci] - u < 1) {
-            return false;
-        }
-        const uint32_t dst = area + RINGS + (((lw >> 12) & 0xFFF) + (u - u0[ci]) % dep) * SLOT;  // (my ring)
         constexpr uint32_t pb = row_bytes + 32;
         auto* h = hdr_at(home, sent % NH);
         h->to_noc_unicast_write(NocUnicastCommandHeader{get_noc_addr(ACC_X(home, o), ACC_Y(home, o), dst)}, pb);
@@ -427,11 +476,12 @@ void kernel_main() {
 #endif
     // drain: every row this port injected is consumed (its credit snapshot landed), so nothing of this call reaches
     // this core after the program ends (the arena is per call: its L1 is another op's after this)
+    // (shared: every grant snapshot addressed to this port landed - each row used a grant, so the counts reach used)
     for (bool open_ = true; open_;) {
         invalidate_l1_cache();
         open_ = false;
         for (uint32_t ci = 0; ci < N * AP; ++ci) {
-            open_ |= cred[ci] != used[ci];
+            open_ |= (SHARED ? grec[(ci / AP) * SNAPW + ci % AP] : cred[ci]) != used[ci];
         }
     }
     // fence: every ring-layout packet addressed to this port has landed before it ends. A home chip h forwards one
@@ -440,7 +490,7 @@ void kernel_main() {
     // this port sends no rows to may forward after this port's work is done, and its packet must not reach the arena
     // once the program has ended (the arena's L1 is another op's then). The packet carries this call's words (tag)
     // for every accumulator o on my link, (o + me + h) % L == lnk (the host keeps A >= L: there is one)
-    for (uint32_t h = 0; h < N; ++h) {
+    for (uint32_t h = 0; h < N && !SHARED; ++h) {  // (shared: no layout packets)
         if (sx[h]) {
             const uint32_t o = (lnk + L - (me + h) % L) % L;
             while ((lay_r[h * AP + o] >> 24) != tag) {

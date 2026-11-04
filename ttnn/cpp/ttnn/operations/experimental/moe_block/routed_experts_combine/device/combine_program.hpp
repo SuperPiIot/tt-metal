@@ -62,6 +62,7 @@ struct CombinePlanInputs {
     std::optional<uint32_t> n_acc;               // the accumulator count the fused head planned (pins A)
     std::optional<CombineMode> mode;             // ... and its mode
     uint32_t depth = 8;
+    std::optional<CombineLanding> landing;       // nullopt: rings
 };
 
 // Everything the combine's program needs that depends only on the mesh, the config and the plan inputs: computed once
@@ -77,6 +78,7 @@ struct CombinePlan {
     uint32_t A = 0, MAXT = 0, PSL = 0, D = 0, QP = 0, QL = 0;
     bool fused = false;    // acc_on_ports
     bool perchip = false;  // per-chip accumulator roles (ports apart): the senders' DRAM LUT
+    bool shared = false;   // the shared landing pool (CombineLanding::Shared)
     CreditPolicy cred;
     CombineAutoChoice choice;
 

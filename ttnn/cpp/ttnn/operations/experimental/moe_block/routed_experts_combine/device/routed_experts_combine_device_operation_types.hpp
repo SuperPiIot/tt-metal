@@ -26,6 +26,9 @@ struct CombineConfig {
     std::optional<CombineMode> mode;    // ... and its mode
     uint32_t arena_bytes = 0;           // the combine's L1 budget a core; 0: the reference's sizing at the first call
     uint32_t depth = 8;                 // landing pool slots per source chip (average)
+    // the landing pool: rings (one a source chip) or shared (slot grants; accumulators apart from the ports);
+    // nullopt: the planner's (rings)
+    std::optional<CombineLanding> landing;
 
     bool operator==(const CombineConfig&) const = default;
 };

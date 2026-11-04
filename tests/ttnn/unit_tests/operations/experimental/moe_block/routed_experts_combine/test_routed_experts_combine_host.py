@@ -47,3 +47,18 @@ def test_auto_invariants():
             assert 1 <= got["n_acc"] <= 16
     counts = collections.Counter(len(mb.combine_state_layout(N, A)) for N in (8, 32) for A in (1, 16))
     assert counts == {10: 4}
+
+
+def test_auto_shared_landing():
+    """The shared landing pool: accumulators apart from the ports only, the pool under 255 slots (slot owners are
+    bytes), the grant rings' state no larger than rings' by more than the grant words and snapshots."""
+    for (N, S, W), arena in itertools.product(SHAPES, ARENAS):
+        for cells, ports in ((19, 8), (30, 8)):
+            got = mb.combine_auto(N, S, W, cells, ports, arena_bytes=arena, landing=mb.CombineLanding.Shared)
+            if not got["fits"]:
+                assert got["why"]
+                continue
+            lay = got["layout"]
+            assert got["shared"] and not got["acc_on_ports"] and "acc_on_ports" not in got["modes"]
+            assert lay["fits"] and N - 1 <= lay["PSL"] <= 254
+            assert max(lay["acc_used"], lay["port_used"]) <= arena

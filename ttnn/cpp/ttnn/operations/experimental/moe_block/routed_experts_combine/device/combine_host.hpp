@@ -30,6 +30,8 @@ inline constexpr uint32_t kAccMax = 16;                 // A_MAX: accumulators a
 inline constexpr uint32_t kMaxChips = 32;               // N at most (the plan's want[16][32], 32-bit masks)
 inline constexpr uint32_t kTabCbBytes = 256 * 8 + 128;  // CB_TAB: the device plan's scratch reads
 inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off writers' words: 64 B rows
+inline constexpr uint32_t kGrants = 8;    // shared landing: slot grants outstanding a (source, accumulator) at most
+inline constexpr uint32_t kSharedPslMax = 254;  // shared landing: slot owners are bytes (0xFF: free)
 
 // Plan tensor word offsets (combine_plan: P_NINJ, P_NRET, P_NLOC, P_WANT, P_ROWS, P_OVER).
 inline constexpr uint32_t kPlanWords = 1024;
@@ -47,12 +49,16 @@ struct RowSlot {
 };
 RowSlot row_slot(uint32_t W);
 
-// _state: byte offsets of the per-core state block; RINGS is its end (the landing pool starts there).
+// _state: byte offsets of the per-core state block; RINGS is its end (the landing pool starts there). G: the shared
+// landing's grant ring (0: rings, no grant words): GIDH (at a home port: per (source, accumulator) G grant ids) and
+// GREC (at a source port: per home its snapshot - AP grant counts, then AP x G ids); the credit snapshots' staging
+// (one per header rotation) grows to a grant snapshot's AP x (1 + G) words.
 struct StateLayout {
     uint32_t CRED = 0, USED = 0, RET = 0, LAYR = 0, LAYO = 0, U0 = 0, CNT = 0, MISC = 0, HDRS = 0, RINGS = 0;
+    uint32_t GIDH = 0, GREC = 0, G = 0;
     bool operator==(const StateLayout&) const = default;
 };
-StateLayout state_layout(uint32_t N, uint32_t A);
+StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G = 0);
 
 // _acc_cbs: an accumulator's CB bytes (CB_TAB, CB_ROW, CB_META, CB_ACC, CB_OUT, CB_W; each 64 B aligned).
 uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT);
@@ -83,9 +89,16 @@ CombineLayout combine_l1_layout(
     bool acc_on_ports = false,
     uint32_t inj_slots = 64,
     uint32_t depth = 8,
-    uint32_t local_keep = 8);
+    uint32_t local_keep = 8,
+    bool shared = false);
 
 enum class CombineMode : uint8_t { PortsApart = 0, AccOnPorts = 1 };
+
+// The landing pool at an accumulator: Rings - carved per call into one ring per source chip (a source's rows go to its
+// ring's next slot, credits return consumed slots); Shared - one free list, the accumulator grants specific slots to
+// the sources with rows pending (ids ride the credit snapshots, tag-validated), so a burst from one source uses slots
+// another source's ring would hold empty. Shared: accumulators apart from the ports only.
+enum class CombineLanding : uint8_t { Rings = 0, Shared = 1 };
 
 // combine_auto: the combine's configuration from the cells the flat plan leaves (n_cells, port_cells of them the
 // ports') and the arena budget. mode: that mode only.
@@ -95,6 +108,7 @@ struct CombineAutoChoice {
     uint32_t inj_slots = 0;
     uint32_t depth = 0;
     uint32_t local_keep = 0;
+    bool shared = false;  // CombineLanding::Shared
     CombineLayout layout;
 };
 struct CombineAuto {
@@ -113,7 +127,8 @@ CombineAuto combine_auto(
     uint32_t arena_bytes,
     uint32_t depth = 8,
     uint32_t a_max = kAccMax,
-    std::optional<CombineMode> mode = std::nullopt);
+    std::optional<CombineMode> mode = std::nullopt,
+    CombineLanding landing = CombineLanding::Rings);
 
 // The credit policy: a port returns a source's credits once it consumed CRED_THR of its rows; its idle credit
 // snapshots are batched (CRED_IDLE rows, or CRED_AGE cycles old) on every mesh.
