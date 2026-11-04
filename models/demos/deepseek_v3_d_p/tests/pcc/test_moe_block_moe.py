@@ -96,7 +96,13 @@ def test_glm_moe_block(mesh_device, device_params):
     H = GLM53Config.EMB_SIZE
     gate, routed, shared = _random_moe_weights(H, GLM53Config.MOE_INTERMEDIATE_SIZE, GLM53Config.NUM_ROUTED_EXPERTS, 3)
     sd = {"gate_weights": gate, "routed_expert_weights": routed, "shared_expert_weights": shared}
-    ffn = TtK3MoEBlockFfn(mesh_device, GLM53Config, layer_idx=6, state_dict=sd)
+    from models.demos.deepseek_v3_d_p.tt.kimi_k3.moe_block_ffn import MoEBlockFfnOptions
+
+    # (GLM_BLOCK_ACCUMULATORS: pin the combine's accumulator count; unset: the planner's)
+    # (GLM_BLOCK_LANDING: the combine's landing pool, rings / shared; unset: the planner's)
+    acc, landing = os.environ.get("GLM_BLOCK_ACCUMULATORS"), os.environ.get("GLM_BLOCK_LANDING")
+    opts = MoEBlockFfnOptions(accumulators=int(acc) if acc else None, combine_landing=landing or None)
+    ffn = TtK3MoEBlockFfn(mesh_device, GLM53Config, layer_idx=6, state_dict=sd, options=opts)
 
     S = GLM_BLOCK_CHUNK
     x = (torch.randn(1, 1, S, H, generator=torch.Generator().manual_seed(7)) * 0.5).to(torch.bfloat16)

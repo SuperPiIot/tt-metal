@@ -54,13 +54,26 @@ class MoEBlockFfnOptions:
         MoEBlockConfig default.
     accumulators: the combine's accumulator count; None: what the combine planner gives (GLM-5.3 / Kimi-K3 at 8x4
         chunk 5120: 11 / 15).
+    combine_landing: the combine's landing pool, "rings" (one ring a source chip) or "shared" (slot grants from one free
+        list, accumulators apart from the ports); None: the planner's (rings).
     gather_experts: a layer's routed-expert sources go to DRAM this many local experts at a time while their faces are
         gathered into the flat layout (all of them next to the laid-out weights held a K3 layer twice: 65 MB a bank)."""
 
     combine_snap: Optional[float] = None
     words_slab_bytes: Optional[int] = None
     accumulators: Optional[int] = None
+    combine_landing: Optional[str] = None
     gather_experts: int = 4
+
+
+def _combine_config(mb, opts: "MoEBlockFfnOptions"):
+    """The combine's CombineConfig for these options (None: MoEBlock's default)."""
+    if opts.combine_landing is None:
+        return None
+    landing = {"rings": mb.CombineLanding.Rings, "shared": mb.CombineLanding.Shared}[opts.combine_landing]
+    cc = mb.CombineConfig()
+    cc.landing = landing
+    return cc
 
 
 def block_dims(model_cfg):
@@ -268,6 +281,7 @@ class TtK3MoEBlockFfn:
                 # (the flat plan's own choices: the gate/up read pieces from its weight block's bytes, the sub-blocks
                 # fitted into the combine's arena)
                 layout=mb.FlatLayoutOptions(),
+                combine=_combine_config(mb, opts),
             )
             logger.info(f"MoE block: {opts}, flat layout {block.expert_kw['layout']}")
             logger.info(
