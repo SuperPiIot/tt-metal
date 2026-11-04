@@ -137,7 +137,7 @@ m2::ProgramSpec make_l1_write_spec(const std::string& name, const m2::Nodes& tar
 
 MeshWorkload make_l1_write_workload(
     MeshDevice& mesh_device, uint32_t address, uint32_t value, const std::string& name) {
-    auto workload = m2::MakeMeshWorkloadFromSpec(mesh_device, make_l1_write_spec(name));
+    auto workload = MakeMeshWorkloadFromSpec(mesh_device, make_l1_write_spec(name));
     auto& program = workload.get_programs().begin()->second;
 
     m2::ProgramRunArgs args;
@@ -146,7 +146,7 @@ MeshWorkload make_l1_write_workload(
         .runtime_arg_values = m2::MakeRuntimeArgsForSingleNode(kNode, {{"address", address}}),
         .common_runtime_arg_values = {{"value", value}},
     }};
-    m2::SetProgramRunArgs(program, args);
+    SetProgramRunArgs(program, args);
     return workload;
 }
 
@@ -165,7 +165,7 @@ MeshWorkload make_l1_write_workload(
         values.emplace(device_range, value);
     }
 
-    auto workload = m2::MakeMeshWorkloadFromSpecs(mesh_device, specs);
+    auto workload = MakeMeshWorkloadFromSpecs(mesh_device, specs);
     for (auto& [device_range, program] : workload.get_programs()) {
         m2::ProgramRunArgs args;
         args.kernel_run_args = {m2::ProgramRunArgs::KernelRunArgs{
@@ -173,7 +173,7 @@ MeshWorkload make_l1_write_workload(
             .runtime_arg_values = m2::MakeRuntimeArgsForSingleNode(kNode, {{"address", address}}),
             .common_runtime_arg_values = {{"value", values.at(device_range)}},
         }};
-        m2::SetProgramRunArgs(program, args);
+        SetProgramRunArgs(program, args);
     }
     return workload;
 }
@@ -288,8 +288,8 @@ m2::ProgramRunArgs loopback_run_args(const MeshTensor& input, const MeshTensor& 
 
 MeshWorkload make_loopback_workload(
     MeshDevice& mesh_device, const MeshTensor& input, const MeshTensor& output, const std::string& name) {
-    auto workload = m2::MakeMeshWorkloadFromSpec(mesh_device, make_loopback_spec(name, input.tensor_spec()));
-    m2::SetProgramRunArgs(workload.get_programs().begin()->second, loopback_run_args(input, output));
+    auto workload = MakeMeshWorkloadFromSpec(mesh_device, make_loopback_spec(name, input.tensor_spec()));
+    SetProgramRunArgs(workload.get_programs().begin()->second, loopback_run_args(input, output));
     return workload;
 }
 
@@ -607,7 +607,7 @@ void kernel_main() {
                 .relaxations = TensorSpecRelaxations{.dynamic_tensor_shape = true}}},
             .work_units = {MakeMinimalWorkUnit("main", kNode, {kKernelName})},
         };
-        auto workload = m2::MakeMeshWorkloadFromSpec(*mesh_device_, spec);
+        auto workload = MakeMeshWorkloadFromSpec(*mesh_device_, spec);
         auto& program = workload.get_programs().begin()->second;
         m2::ProgramRunArgs args;
         args.kernel_run_args = {m2::ProgramRunArgs::KernelRunArgs{
@@ -616,7 +616,7 @@ void kernel_main() {
             .common_runtime_arg_values = leading_values,
         }};
         args.tensor_args = {{m2::TensorParamName{"io"}, m2::ProgramRunArgs::TensorArgument{recorded}}};
-        m2::SetProgramRunArgs(program, args);
+        SetProgramRunArgs(program, args);
 
         CommandListBuilder builder(*mesh_device_);
         builder.add(
@@ -658,7 +658,7 @@ void kernel_main() {
 }
 )"};
     kernel.runtime_arg_schema = {.runtime_arg_names = {"address"}, .common_runtime_arg_names = crta_names};
-    auto workload = m2::MakeMeshWorkloadFromSpec(
+    auto workload = MakeMeshWorkloadFromSpec(
         *mesh_device_,
         m2::ProgramSpec{
             .name = "window_neighbors",
@@ -672,7 +672,7 @@ void kernel_main() {
         .runtime_arg_values = m2::MakeRuntimeArgsForSingleNode(kNode, {{"address", kAddressA}}),
         .common_runtime_arg_values = {{"first", 0}, {"second", 0}, {"third", 0}},
     }};
-    m2::SetProgramRunArgs(program, args);
+    SetProgramRunArgs(program, args);
 
     CmdListParameters parameters;
     for (const auto& name : crta_names) {
@@ -707,7 +707,7 @@ TEST_F(CommandListTest, UpdatesEveryTargetOfAParameter) {
     constexpr uint32_t kPatchedValue = 0xCAFE0003;
     const m2::NodeCoord other_node{1, 0};
     auto two_nodes =
-        m2::MakeMeshWorkloadFromSpec(*mesh_device_, make_l1_write_spec("two_nodes", m2::NodeRange(kNode, other_node)));
+        MakeMeshWorkloadFromSpec(*mesh_device_, make_l1_write_spec("two_nodes", m2::NodeRange(kNode, other_node)));
     auto& two_node_program = two_nodes.get_programs().begin()->second;
     auto rtas = m2::MakeRuntimeArgsForSingleNode(kNode, {{"address", kAddressA}});
     m2::AddRuntimeArgsForNode(rtas, other_node, {{"address", kAddressA}});
@@ -717,7 +717,7 @@ TEST_F(CommandListTest, UpdatesEveryTargetOfAParameter) {
         .runtime_arg_values = rtas,
         .common_runtime_arg_values = {{"value", kValueA}},
     }};
-    m2::SetProgramRunArgs(two_node_program, args);
+    SetProgramRunArgs(two_node_program, args);
     auto one_node = make_l1_write_workload(*mesh_device_, kAddressC, kValueB, "one_node");
     auto& one_node_program = one_node.get_programs().begin()->second;
 
@@ -985,7 +985,7 @@ TEST_F(CommandListTest, AllowsTemporaryTensorLifetimeDuringBuild) {
 
     // Create a workload that copies an input tensor to the persistent output.
     auto workload =
-        m2::MakeMeshWorkloadFromSpec(*mesh_device_, make_loopback_spec("temporary_tensor_lifetime", tensor_spec));
+        MakeMeshWorkloadFromSpec(*mesh_device_, make_loopback_spec("temporary_tensor_lifetime", tensor_spec));
     auto& program = workload.get_programs().begin()->second;
 
     // Allocate the input during recording and bind it to the workload added to the command list.
@@ -996,7 +996,7 @@ TEST_F(CommandListTest, AllowsTemporaryTensorLifetimeDuringBuild) {
             mesh_device_->mesh_command_queue(0), reinterpret_cast<const std::byte*>(expected.data()), temporary);
         Finish(mesh_device_->mesh_command_queue(0));
 
-        m2::SetProgramRunArgs(program, loopback_run_args(temporary, output));
+        SetProgramRunArgs(program, loopback_run_args(temporary, output));
         builder.add(workload);
     }
 
@@ -1382,12 +1382,12 @@ TEST_F(CommandListTest, RejectsUnresolvableParametersWithoutChangingTheRecording
     borrowed_spec.dataflow_buffers.at(0).borrowed_from = m2::TensorParamName{"scratch_tensor"};
     borrowed_spec.tensor_parameters.push_back(
         m2::TensorParameter{.unique_id = m2::TensorParamName{"scratch_tensor"}, .spec = scratch_spec});
-    auto borrowed_workload = m2::MakeMeshWorkloadFromSpec(*mesh_device_, borrowed_spec);
+    auto borrowed_workload = MakeMeshWorkloadFromSpec(*mesh_device_, borrowed_spec);
     auto& borrowed_program = borrowed_workload.get_programs().begin()->second;
     auto borrowed_args = loopback_run_args(input, output);
     borrowed_args.tensor_args.emplace(
         m2::TensorParamName{"scratch_tensor"}, m2::ProgramRunArgs::TensorArgument{scratch});
-    m2::SetProgramRunArgs(borrowed_program, borrowed_args);
+    SetProgramRunArgs(borrowed_program, borrowed_args);
     EXPECT_THAT(
         [&] {
             builder.add(
