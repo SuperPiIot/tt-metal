@@ -46,14 +46,18 @@ void kernel_main() {
     const uint64_t prim2_land = get_noc_addr(p2xy >> 16, p2xy & 0xFFFF, land);
     const uint64_t prim2_data = get_noc_addr(p2xy >> 16, p2xy & 0xFFFF, get_semaphore(data_sem));
     volatile tt_l1_ptr uint32_t* credit2 = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(6));
+    constexpr uint32_t nsb = get_compile_time_arg_val(7);
     for (uint32_t b = 0; b < num_sb; ++b) {
         cb_wait_front(sb_cb, sb_tiles);
         if (b >= land_slots) {
             noc_semaphore_wait_min(credit, b + 1 - land_slots);  // the slot's previous super-block has been sent
             noc_semaphore_wait_min(credit2, b + 1 - land_slots);
         }
-        noc_async_write(get_read_ptr(sb_cb), prim_land + (b % land_slots) * sb_bytes, sb_bytes);
-        noc_async_write(get_read_ptr(sb_cb), prim2_land + (b % land_slots) * sb_bytes, sb_bytes);
+        // (row tile major: a short last sub-block's rows are the super-block's first bytes - only those go)
+        const uint32_t g = x2k + (place + b * round_) * x2s;
+        const uint32_t bytes = se_dyn_v_rows(dyn, g / nsb, mt) * SE_SBT * tb;
+        noc_async_write(get_read_ptr(sb_cb), prim_land + (b % land_slots) * sb_bytes, bytes);
+        noc_async_write(get_read_ptr(sb_cb), prim2_land + (b % land_slots) * sb_bytes, bytes);
         noc_async_write_barrier();
         noc_semaphore_inc(prim_data, 1);
         noc_semaphore_inc(prim2_data, 1);

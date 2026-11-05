@@ -57,6 +57,18 @@ struct SeDyn {
     uint32_t rps = 0;          // rows per sub-block
 };
 
+// The row tiles holding tokens of virtual sub-block v (the schedule's order: entry by entry, its sub-blocks): mt for
+// all but an entry's last sub-block. The x path ships only those (a short last sub-block); the compute does too.
+inline uint32_t se_dyn_v_rows(const SeDyn& d, uint32_t v, uint32_t mt) {
+    for (uint32_t a = 0; a < d.n_act; ++a) {
+        if (v < d.subs[a]) {
+            return v + 1u == d.subs[a] ? (d.cnt[a] - (d.subs[a] - 1u) * d.rps + 31) / 32 : mt;
+        }
+        v -= d.subs[a];
+    }
+    return mt;
+}
+
 // Ring regions from the retirement order; false if some load would wait on a retirement that comes after its use.
 inline bool se_dyn_regions(SeDyn& d) {
     // (8-bit: entries < SE_MAX_V <= 128; the 8 KB RISC local memory holds the stack, SeDyn and the pin copy)

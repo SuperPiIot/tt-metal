@@ -87,9 +87,11 @@ void kernel_main() {
         // the batch's pieces into the snake head (unicast, under the batch's transaction id); the head forwards them
         // along the snake, gate_up_core_reader.cpp
         chain_retire(XMC_CHAIN_DEPTH - 1);  // (room for this batch's id)
+        // (a short last sub-block: only its row tiles holding tokens go; the head's XARR still counts every piece)
+        const uint32_t lr = se_dyn_v_rows(dyn, b / nsb, mt);
         for (uint32_t k = 0; k < per_sb; ++k) {
             const uint32_t dst = ring + ((sent + k) % x_slots) * blk_bytes;
-            for (uint32_t m = 0; m < mt; ++m) {
+            for (uint32_t m = 0; m < lr; ++m) {
                 noc_async_write_one_packet_with_trid(
                     src + (m * SE_SBT + k * kblk) * tb,
                     get_noc_addr(hxy >> 16, hxy & 0xFFFF, dst + m * piece),

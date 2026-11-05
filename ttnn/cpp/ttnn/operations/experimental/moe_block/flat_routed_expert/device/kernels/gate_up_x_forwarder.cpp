@@ -23,6 +23,8 @@ void kernel_main() {
     constexpr uint32_t xp = get_compile_time_arg_val(2), xarr_id = get_compile_time_arg_val(3);
     constexpr uint32_t sfree_id = get_compile_time_arg_val(4), xcons_id = get_compile_time_arg_val(5);
     constexpr uint32_t xend_id = get_compile_time_arg_val(6), depth = get_compile_time_arg_val(7);
+    // (CT 8 NB: x blocks a sub-block, CT 9 MT: row tiles a block)
+    constexpr uint32_t nb = get_compile_time_arg_val(8), mt = get_compile_time_arg_val(9);
     static_assert(depth >= 1 && depth <= 14);
     constexpr uint32_t piece = x_bytes / xp;
     const uint32_t x_ring = get_arg_val<uint32_t>(0);
@@ -52,6 +54,19 @@ void kernel_main() {
         gr.init(6, SE_GU_BLK, SE_GU_PER_E, SE_GU_DEPTH, mb[0], mb + 1, sem(SE_GU_GRANT_SEM), sem(SE_GU_DATA_SEM));
         g_done = gr.total == 0;
     }
+    // a short last sub-block: its blocks' pieces past its row tiles holding tokens carry nothing - counted (XARR), not
+    // written. The entries (sub-blocks | last one's row tiles << 16) follow the loads list in the mailbox.
+    const volatile tt_l1_ptr uint32_t* xe =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(tt::CBIndex::c_7) + 2 * SE_DYN_HALF) + 1 +
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(tt::CBIndex::c_7) + 2 * SE_DYN_HALF)[0];
+    const uint32_t n_ent = xe[0];
+    uint32_t ca = 0, cs = 0, cv_end = nb, cnp = xp;  // the block cursor's entry / sub-block, its end block, its pieces
+    auto set_np = [&]() {
+        const uint32_t subs = ca < n_ent ? (xe[1 + ca] & 0xFFFF) : 1u;
+        const uint32_t lr = ca < n_ent && cs + 1 == subs ? (xe[1 + ca] >> 16) : mt;
+        cnp = (lr * xp + mt - 1) / mt;
+    };
+    set_np();
     while (true) {
         invalidate_l1_cache();
         if (!g_done) {
@@ -60,6 +75,18 @@ void kernel_main() {
         if (sxy) {
             const uint32_t arrived = *xarr;
             while (iss < arrived && iss - fwd < depth && (iss / xp < x_slots || *sfree >= iss / xp + 1 - x_slots)) {
+                while (iss / xp >= cv_end) {  // (the cursor onto the block's sub-block)
+                    cv_end += nb;
+                    if (ca < n_ent && ++cs == (xe[1 + ca] & 0xFFFF)) {
+                        cs = 0;
+                        ++ca;
+                    }
+                    set_np();
+                }
+                if (iss % xp >= cnp) {  // (an empty piece: nothing to write, its count goes on in order)
+                    ++iss;
+                    continue;
+                }
                 const uint32_t off = ((iss / xp) % x_slots) * x_bytes + (iss % xp) * piece;
                 for (uint32_t o = 0; o < piece; o += NOC_MAX_BURST_SIZE) {
                     const uint32_t n = piece - o < NOC_MAX_BURST_SIZE ? piece - o : NOC_MAX_BURST_SIZE;

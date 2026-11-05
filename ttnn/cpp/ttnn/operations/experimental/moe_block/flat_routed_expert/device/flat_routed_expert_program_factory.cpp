@@ -454,7 +454,7 @@ FlatProgramHandles add_flat_routed_expert_program(
                p.gu,
                DataMovementProcessor::RISCV_1,
                NOC::NOC_0,
-               {p.x_slots, x_bytes, x_pieces, XARR, SFREE, 2, 3, X_FWD_DEPTH},
+               {p.x_slots, x_bytes, x_pieces, XARR, SFREE, 2, 3, X_FWD_DEPTH, p.nsb * p.sbt / kKBlk, MT},
                gu_def);
         const bool gu_rp = p.gu_rp && !p.gu_full_sync;
         Defines cdef = with(

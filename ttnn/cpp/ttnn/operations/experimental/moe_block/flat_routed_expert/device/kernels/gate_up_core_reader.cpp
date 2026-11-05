@@ -88,6 +88,12 @@ void kernel_main() {
         for (uint32_t l = 0; l < dyn.n_load; ++l) {
             mb[1 + l] = dyn.load_eid[l] | (uint32_t(dyn.region[l]) << 8);
         }
+        // then the x forwarder's: the entries' sub-blocks and their last one's row tiles holding tokens
+        volatile tt_l1_ptr uint32_t* xe = mb + 1 + dyn.n_load;
+        xe[0] = dyn.n_act;
+        for (uint32_t a = 0; a < dyn.n_act; ++a) {
+            xe[1 + a] = dyn.subs[a] | (((dyn.cnt[a] - (dyn.subs[a] - 1u) * dyn.rps + 31) / 32) << 16);
+        }
         *sem(SE_GU_MBOX_SEM) = 1;
     }
     grant(w_slots);  // every landing slot starts free
