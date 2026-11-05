@@ -11,6 +11,13 @@ import torch
 import ttnn
 from tt_py_test_utils_common.utility_functions import is_blackhole
 from tests.ttnn.utils_for_testing import assert_equal, assert_with_pcc
+from tests.ttnn.unit_tests.operations.data_movement.docstring_support import (
+    assert_exact,
+    docstring_dtype_layout_params,
+    docstring_interleaved_buffer_type_params,
+    interleaved_memory_config,
+    torch_input,
+)
 
 
 def random_torch_tensor(dtype, shape):
@@ -821,3 +828,20 @@ def test_permute_cache_miss_different_factory_row_major(device, isolate_program_
     assert_with_pcc(ref2, out2, 0.9999)
 
     assert device.cache_entries_counter.total == 2
+
+
+@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.permute))
+@pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.permute))
+def test_permute_docstring_supported_inputs(dtype, layout, buffer_type, device):
+    """Runs every dtype, layout and interleaved buffer type the ttnn.permute docstring lists."""
+    memory_config = interleaved_memory_config(buffer_type)
+    input_tensor = ttnn.from_torch(
+        torch_input((2, 3, 32, 64), dtype), dtype=dtype, layout=layout, device=device, memory_config=memory_config
+    )
+    # (0, 2, 1, 3) keeps the last dimension in place, so block-float values come back unchanged.
+    output = ttnn.permute(input_tensor, (0, 2, 1, 3), memory_config=memory_config)
+
+    assert output.dtype == dtype
+    assert output.layout == layout
+    assert output.memory_config().buffer_type == buffer_type
+    assert_exact(ttnn.to_torch(input_tensor).permute(0, 2, 1, 3), ttnn.to_torch(output))
