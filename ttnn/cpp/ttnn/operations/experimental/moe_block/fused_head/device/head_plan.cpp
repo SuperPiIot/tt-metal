@@ -104,6 +104,8 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
         }
     }
     const uint32_t nc = nrt;
+    const uint32_t npo = planner_only_cores(
+        shape.loops, nc, head_free_cells(shape.grid[0], gy, lay.GX, lay.GY, nrt + 2 * L + 1 > gy ? nrt : 0).size());
     const uint32_t ET = shape.E / 32;
     const auto [roff, rbytes] = router_layout(G, ET, shape.K, ET, shape.loops > 1);
     if (rbytes > arena) {
@@ -121,7 +123,7 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
                s(EPC) + " <= 64";
     }
     // (the last token loop's planner - or the only one's - over the router's dead buffers [0, bias) where it fits)
-    const auto pp = place_planner(N, S, K, EPC, A, nc, region_of(roff, "bias"), rbytes, arena);
+    const auto pp = place_planner(N, S, K, EPC, A, nc, region_of(roff, "bias"), rbytes, arena, 0, npo);
     const uint32_t M = pp.M;
     if (!pp.ok) {
         const int64_t per = ceil_div(std::max<uint32_t>(M, 1), nc);
@@ -131,7 +133,7 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
         return "routing planner: " + what + " > the arena's " + kb0(arena) + " KB";
     }
     if (shape.loops > 1) {  // (an earlier loop's: M instances planning no token, past the router's bytes)
-        const auto idle = place_planner(N, kPlannerIdleS, K, EPC, A, nc, 0, rbytes, arena, M);
+        const auto idle = place_planner(N, kPlannerIdleS, K, EPC, A, nc, region_of(roff, "arr"), rbytes, arena, M, npo);
         if (!idle.ok) {
             return "routing planner: an earlier token loop's " + s(M) + " instances past the router's " + kb0(rbytes) +
                    " KB > the arena's " + kb0(arena) + " KB";

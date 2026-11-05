@@ -1413,16 +1413,22 @@ PlannerPlace place_planner(
     int64_t overlay,
     int64_t rbytes,
     int64_t arena,
-    uint32_t fixed_M) {
+    uint32_t fixed_M,
+    uint32_t nx) {
     PlannerPlace p;
+    p.nc = nc;
+    p.nx = nx;
     const int64_t rows_cap = routing_worst_rows(N, S, K, EPC);
-    uint32_t M = fixed_M ? fixed_M : std::min({2 * nc, EPC, A, 14u});
+    uint32_t M = fixed_M ? fixed_M : std::min({2 * (nc + nx), EPC, A, 14u});
     for (; M > 0; --M) {
         p.sz = routing_a2a_sizes(N, S, K, EPC, A, rows_cap, M);
         p.step = al64(p.sz.plan_l1);
-        const int64_t per = ceil_div(int64_t(M), int64_t(nc));
-        p.pl0 = !fixed_M && per * p.step <= overlay ? 0 : al64(rbytes);
-        if (p.sz.fits && p.pl0 + per * p.step <= arena) {
+        // (the regions a planner-only core and a router core hold at most)
+        const int64_t per_x = nx ? std::min<int64_t>(2, ceil_div(int64_t(M), int64_t(nx))) : 0;
+        const int64_t mr = std::max<int64_t>(0, int64_t(M) - 2 * int64_t(nx));
+        const int64_t per_r = ceil_div(mr, int64_t(nc));
+        p.pl0 = per_r * p.step <= overlay ? 0 : al64(rbytes);
+        if (p.sz.fits && p.pl0 + per_r * p.step <= arena && per_x * p.step <= arena) {
             p.ok = true;
             p.M = M;
             return p;

@@ -76,9 +76,9 @@ uint32_t MoEBlockConfig::snap_bits() const { return moe_block::snap_bits(combine
 void MoEBlockConfig::check() const {
     TT_FATAL(num_links >= 1 && num_links <= 2, "moe_block: num_links {} (1 or 2)", num_links);
     TT_FATAL(
-        chunk_tokens % (splits() * loops()) == 0,
+        plan_tokens() % (splits() * loops()) == 0,
         "moe_block: chunk {} does not split into {} splits x {} token loops",
-        chunk_tokens,
+        plan_tokens(),
         splits(),
         loops());
     (void)snap_bits();

@@ -53,6 +53,9 @@ struct HeadShape {
     // the routing planner and exchange are sized for all of them (SA tokens a chip) and plan them in the last call
     uint32_t loops = 1;
     uint32_t splits = 1;  // the block's splits (chunk_splits): a padded chunk's rows of the whole chunk
+    // the caller's tokens an SP row (chunk_tokens / SP: without the padding rows, MoEBlockConfig.pad_tokens) - main's
+    // closed form of an SP row's real rows; 0: splits x loops x rows
+    uint32_t row_tokens = 0;
 
     int rs_dim() const { return latent ? -1 : -2; }
     uint32_t N() const { return R * G; }

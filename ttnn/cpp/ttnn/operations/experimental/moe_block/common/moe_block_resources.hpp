@@ -125,7 +125,7 @@ public:
     // MoEBlockConfig.token_loops = k, chunk_splits = b: the ops plan for them from here on. Drops every plan and
     // persistent tensor made so far (a block picking its loops by planning): only before any op call or weight
     // preparation.
-    void set_token_loops(uint32_t k, uint32_t b = 1);
+    void set_token_loops(uint32_t k, uint32_t b = 1, uint32_t pad = 0);
 
     void freeze() { frozen_ = true; }
     bool frozen() const { return frozen_; }

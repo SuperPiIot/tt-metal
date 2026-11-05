@@ -101,10 +101,17 @@ struct MoEBlockConfig {
     // dispatch / combine (or a looping head) of the whole chunk does not fit. Each piece runs token_loops head / tail
     // calls. 0: MoEBlock picks (the fewest splits, then the fewest loops); the ops take 0 as 1.
     uint32_t chunk_splits = 0;
+    // Padding rows: the ops run the chunk with pad_tokens more tokens, pad_tokens / SP rows appended to each SP row's
+    // (a chunk whose rows a mesh row are not a multiple of 32 x TP - the head's rows rule); they are padding tokens of
+    // a padded chunk (not routed), the fused head always takes the chunk's actual_start / actual_end (MoEBlock gives
+    // (0, chunk) for an unpadded one) and MoEBlock drops their rows of the output.
+    uint32_t pad_tokens = 0;
     uint32_t loops() const { return token_loops == 0 ? 1u : token_loops; }
     uint32_t splits() const { return chunk_splits == 0 ? 1u : chunk_splits; }
+    // the tokens the ops run: the chunk and its padding rows
+    uint32_t plan_tokens() const { return chunk_tokens + pad_tokens; }
     // the tokens the dispatch and the experts + combine are planned for: one split's
-    uint32_t split_tokens() const { return chunk_tokens / splits(); }
+    uint32_t split_tokens() const { return plan_tokens() / splits(); }
     // the tokens a head / tail call is planned for: one loop's
     uint32_t loop_tokens() const { return split_tokens() / loops(); }
 

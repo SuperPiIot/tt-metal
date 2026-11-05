@@ -40,6 +40,11 @@ Tensor fused_tail(
 // over TP (chip (r, c) takes output columns [c H/TP, (c + 1) H/TP)), the rmsnorm weight latent_norm [Hr] folded in
 // (W' = diag(g) W_up^T), as K-range regions of each engine column spread over the DRAM banks. dtype: bfloat8_b (the
 // reference's) or bfloat16.
+// Host only: does the tail of a call (the resources' loop_tokens a chunk) fit its L1? Raises (TT_FATAL) with why not.
+// Plans uncached (the call's plan is made by its first call / weight preparation): a latent model's engine for W_up
+// tiles of `dtype`, else the all-to-all.
+void plan_fused_tail(MoEBlockResources& resources, DataType dtype = DataType::BFLOAT8_B);
+
 Tensor prepare_fused_tail_weights(
     const Tensor& latent_up,
     const Tensor& latent_norm,

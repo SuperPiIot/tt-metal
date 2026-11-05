@@ -54,6 +54,14 @@ void bind_fused_tail(nb::module_& mod) {
         nb::arg("math_fidelity") = tt::tt_metal::MathFidelity::HiFi2,
         nb::arg("output") = nb::none());
 
+    mod.def(
+        "plan_fused_tail",
+        &plan_fused_tail,
+        nb::arg("resources"),
+        nb::arg("dtype") = DataType::BFLOAT8_B,
+        "Host only: raises when the tail of a call (resources.config.loop_tokens a chunk) does not fit its L1 (a "
+        "latent "
+        "model's engine for W_up tiles of dtype, else the all-to-all); plans uncached.");
     ttnn::bind_function<"prepare_fused_tail_weights", "ttnn.experimental.moe_block.">(
         mod,
         R"doc(

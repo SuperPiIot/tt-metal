@@ -221,6 +221,26 @@ public:
     std::map<std::pair<uint32_t, uint32_t>, XDir> ties;  // (p, b) of a ring's far side -> the fabric's way
     // router
     std::vector<CoreCoord> rcores;
+    // the routing planner's cores: the router cores, then (token loops) planner-only cores - instance q on core
+    // q's per pslot(q)
+    std::vector<CoreCoord> pcores;
+    uint32_t npo = 0;  // planner-only cores (pcores past the router cores)
+    // instance q's planner core (pcores index) and RISC (head_sizing planner_slot)
+    std::pair<uint32_t, uint32_t> pslot(uint32_t q) const {
+        const auto s = planner_slot(q, u32(rcores.size()), npo);
+        return {s.router ? s.core : u32(rcores.size()) + s.core, s.risc};
+    }
+    // the instance on pcores[c]'s RISC r, or -1
+    int32_t inst_at(uint32_t c, uint32_t r) const {
+        for (uint32_t q = 0; q < M; ++q) {
+            if (pslot(q) == std::make_pair(c, r)) {
+                return int32_t(q);
+            }
+        }
+        return -1;
+    }
+    // instance 0's core: the routing packets' arrival counters, the planners' parts
+    CoreCoord p0core() const { return pcores[pslot(0).first]; }
     uint32_t RB = 0, KT = 0, ET = 0, K = 0, NS = 1;
     // router iterations (HeadLayout.NIT): the router stage over RBi = RB / NIT of my owned row tiles at a time, one
     // router core each
@@ -815,24 +835,35 @@ std::shared_ptr<const HeadModel> make_head_model(
     h.rows_cap = u32(routing_worst_rows(h.N, h.SA, h.K, h.EPC));
     {
         const uint32_t nc = u32(h.rcores.size());
+        // (token loops: planner-only cores in the cells no head piece takes)
+        const auto free = head_free_cells(h.grid.x, h.grid.y, e.GX, e.GY, nc + 2 * h.L + 1 > h.grid.y ? nc : 0);
+        const uint32_t nx = planner_only_cores(h.loops, nc, free.size());
+        h.pcores = h.rcores;
+        h.npo = nx;
+        for (uint32_t i = 0; i < nx; ++i) {
+            h.pcores.emplace_back(free[i].first, free[i].second);
+        }
         const int64_t bias =
             std::get<1>(*std::find_if(h.roff.begin(), h.roff.end(), [](const auto& r) { return r.first == "bias"; }));
-        const auto pp = place_planner(h.N, h.SA, h.K, h.EPC, h.A, nc, bias, h.rbytes, h.arena_bytes);
+        const auto pp = place_planner(h.N, h.SA, h.K, h.EPC, h.A, nc, bias, h.rbytes, h.arena_bytes, 0, nx);
         TT_FATAL(pp.ok, "fused_head: routing planner: no room ({})", pp.sz.why);
         h.M = pp.M;
         h.inst_cap = u32(pp.sz.inst_cap);
         h.plan_l1 = pp.sz.plan_l1;
         h.pl_step = pp.step;
         for (uint32_t q = 0; q < h.M; ++q) {
-            h.pbases_off.push_back(pp.pl0 + int64_t(q / nc) * pp.step);
+            h.pbases_off.push_back(pp.pbase(q));
         }
         if (h.loops > 1) {  // (an earlier token loop's planner: the same instances, no token, past the router's bytes)
-            const auto idle = place_planner(h.N, kPlannerIdleS, h.K, h.EPC, h.A, nc, 0, h.rbytes, h.arena_bytes, h.M);
+            const int64_t arr = std::get<1>(
+                *std::find_if(h.roff.begin(), h.roff.end(), [](const auto& r) { return r.first == "arr"; }));
+            const auto idle =
+                place_planner(h.N, kPlannerIdleS, h.K, h.EPC, h.A, nc, arr, h.rbytes, h.arena_bytes, h.M, nx);
             TT_FATAL(idle.ok, "fused_head: an earlier token loop's routing planner: no room ({})", idle.sz.why);
             h.rows_cap_idle = u32(routing_worst_rows(h.N, kPlannerIdleS, h.K, h.EPC));
             h.inst_cap_idle = u32(idle.sz.inst_cap);
             for (uint32_t q = 0; q < h.M; ++q) {
-                h.pbases_idle.push_back(idle.pl0 + int64_t(q / nc) * idle.step);
+                h.pbases_idle.push_back(idle.pbase(q));
             }
         }
     }
@@ -932,8 +963,8 @@ std::vector<HeadWordsSpec> head_words(const HeadModel& h) {
         {"rt", cells(h.rcores), 4 * 2},
         {"slot_words", cells(h.rcores), 4 * std::max<uint32_t>(1, h.G - 1)},
         {"sfree", cells(h.rcores), 32},
-        {"ra_c", cells({h.rcores[0]}), 4 * 2},
-        {"ra_p", cells(h.rcores), 4 * 9},
+        {"ra_c", cells({h.p0core()}), 4 * 2},
+        {"ra_p", cells(h.pcores), 4 * 9},
         {"ra_s", cells(pw), 4 * 4},
         {"yhello", cells({h.watcher}), 16},
     };
@@ -2147,7 +2178,7 @@ std::vector<KernelDescriptor> ChipProgram::gather(std::vector<CBDescriptor>& cbs
 
 void ChipProgram::routing_defines(KernelDescriptor& k) const {
     for (const auto& [n, v] : std::vector<std::pair<std::string, int64_t>>{
-             {"RA_NC_", int64_t(h.rcores.size())},
+             {"RA_NC_", int64_t(h.pcores.size())},
              {"RA_NP_", h.RB},
              {"RA_N_", h.N},
              {"RA_M_", h.M},
@@ -2219,7 +2250,7 @@ Args ChipProgram::fwd_block(const SendKey& k) const {
         return {0u};
     }
     const auto& lst = it->second;
-    const auto p0 = h.virt(h.rcores[0]);
+    const auto p0 = h.virt(h.p0core());
     const auto nd = h.node(coord);
     TT_FATAL(lst.size() <= h.NF, "fused_head: routing: a port forwards {} packets > its {} slots", lst.size(), h.NF);
     const uint32_t ki = u32(std::find(h.fkeys.begin(), h.fkeys.end(), k) - h.fkeys.begin());
@@ -2242,7 +2273,7 @@ Args ChipProgram::send_block(const SendKey& k) const {
     const auto& dests = it->second;
     const uint32_t self_ = dests.back() == me ? 1 : 0;
     const uint32_t nr = u32(dests.size()) - self_;
-    const auto p0 = h.virt(h.rcores[0]);
+    const auto p0 = h.virt(h.p0core());
     std::vector<SendKey> ykeys;
     for (const auto& [kk, _] : sv) {
         if (kk.y) {
@@ -2324,10 +2355,11 @@ std::function<Args(uint32_t)> ChipProgram::planner_args() const {
     for (uint8_t v : lut) {
         add(head, uint32_t(v));
     }
-    const uint32_t nc = u32(h.rcores.size());
+    // (the planner cores: instance q on pcores[pslot(q).first], its RISC pslot(q).second)
+    auto risc0 = [this](uint32_t q) { return h.pslot(q).second == 0; };
     std::vector<uint32_t> pxy;
     for (uint32_t q = 0; q < h.M; ++q) {
-        const auto v = h.virt(h.rcores[q % nc]);
+        const auto v = h.virt(h.pcores[h.pslot(q).first]);
         pxy.push_back(u32(v.x));
         pxy.push_back(u32(v.y));
     }
@@ -2336,10 +2368,10 @@ std::function<Args(uint32_t)> ChipProgram::planner_args() const {
         inst.push_back(base + u32(pb));
     }
     for (uint32_t q = 0; q < h.M; ++q) {
-        inst.push_back(q < nc ? ra.at("ex") : ra.at("ex2"));
+        inst.push_back(risc0(q) ? ra.at("ex") : ra.at("ex2"));
     }
     for (uint32_t q = 0; q < h.M; ++q) {
-        inst.push_back(q < nc ? ra.at("go") : ra.at("go2"));
+        inst.push_back(risc0(q) ? ra.at("go") : ra.at("go2"));
     }
     Args dst;
     for (uint32_t d = 0; d < h.N; ++d) {
@@ -2361,45 +2393,46 @@ std::function<Args(uint32_t)> ChipProgram::planner_args() const {
     }
     const Args tail = {ra.at("ready")};
     auto ra_ = ra;
-    return [=](uint32_t q) {
+    return [=, this](uint32_t q) {
         Args a = head;
-        a[4] = q < nc ? ra_.at("calls_p") : ra_.at("calls_p2");
+        a[4] = risc0(q) ? ra_.at("calls_p") : ra_.at("calls_p2");
         add(a, Args{q, 0, 0});
         add(a, pxy);
         add(a, inst);
         add(a, dst);
         add(a, port_args);
         add(a, tail);
-        add(a, Args{q < nc ? ra_.at("go") : ra_.at("go2"), ra_.at("parts"), q < nc ? ra_.at("ex") : ra_.at("ex2")});
+        add(a, Args{risc0(q) ? ra_.at("go") : ra_.at("go2"), ra_.at("parts"), risc0(q) ? ra_.at("ex") : ra_.at("ex2")});
         return a;
     };
 }
 
 Args ChipProgram::ra_args(uint32_t j) const {
     std::vector<uint32_t> pxy;
-    for (const auto& c : h.rcores) {
+    for (const auto& c : h.pcores) {  // (every planner core: told when my rows are written)
         const auto v = h.virt(c);
         pxy.push_back(u32(v.x));
         pxy.push_back(u32(v.y));
     }
-    if (j >= h.M) {
+    const int32_t q = h.inst_at(j, 0);  // (router core j = pcores[j]: its BRISC's instance)
+    if (q < 0) {
         Args a = {ra.at("rows"), ra.at("rows2"), 0u};
         add(a, pxy);
         return a;
     }
-    Args a = {ra.at("rows"), ra.at("rows2"), base + u32(pbases()[j])};
+    Args a = {ra.at("rows"), ra.at("rows2"), base + u32(pbases()[q])};
     add(a, pxy);
-    add(a, planner_args()(j));
+    add(a, planner_args()(u32(q)));
     return a;
 }
 
 Args ChipProgram::ra_args2(uint32_t j) const {
-    const uint32_t q = j + u32(h.rcores.size());
-    if (q >= h.M) {
+    const int32_t q = h.inst_at(j, 1);  // (its NCRISC's)
+    if (q < 0) {
         return {ra.at("rows2"), 0u};
     }
     Args a = {ra.at("rows2"), base + u32(pbases()[q])};
-    add(a, planner_args()(q));
+    add(a, planner_args()(u32(q)));
     return a;
 }
 
@@ -2533,7 +2566,7 @@ std::vector<KernelDescriptor> ChipProgram::router(std::vector<CBDescriptor>& cbs
                 S(SRC_END),
                 Arg(coord.first),
                 Arg(h.R),
-                Arg(sub * bufs.loops * h.splits),
+                Arg(h.cfg.shape.row_tokens ? h.cfg.shape.row_tokens : sub * bufs.loops * h.splits),
                 Arg((g0 + bufs.loop) * sub + p * h.S),
                 Arg(h.S),
                 Arg(sub),
@@ -2623,6 +2656,37 @@ std::vector<KernelDescriptor> ChipProgram::router(std::vector<CBDescriptor>& cbs
         push(ks, nk);
         push(ks, ck);
         push(ks, bk);
+    }
+    // token loops: the planner-only cores (instances q = their index past the router cores, and q + pcores)
+    if (h.pcores.size() > h.rcores.size()) {
+        const std::vector<CoreCoord> xs(h.pcores.begin() + h.rcores.size(), h.pcores.end());
+        const auto planner_fn = planner_args();
+        for (const bool second : {false, true}) {
+            auto k = kernel(
+                "dataflow/planner_only.cpp",
+                cells(xs),
+                second ? dm(DataMovementProcessor::RISCV_1, NOC::NOC_0)
+                       : dm(DataMovementProcessor::RISCV_0, NOC::NOC_1));
+            k.compile_time_args = ra_ct;
+            planner_defines(k, 0);
+            if (padded) {
+                define(k, "RT_VALID");
+            }
+            for (uint32_t i = 0; i < xs.size(); ++i) {
+                const int32_t q = h.inst_at(u32(h.rcores.size()) + i, second ? 1 : 0);
+                Args a = {ra.at(second ? "rows2" : "rows")};
+                if (q >= 0) {
+                    a.push_back(base + u32(pbases()[q]));
+                    add(a, planner_fn(u32(q)));
+                } else {
+                    a.push_back(0u);
+                }
+                set_rt(k, xs[i], a);
+            }
+            set_common(k, common_v);
+            routing_accessors(k);
+            push(ks, k);
+        }
     }
     return ks;
 }
@@ -2728,7 +2792,7 @@ HeadTensorShapes head_tensor_shapes(const HeadModel& h) {
 }
 
 CoreRangeSet head_arena_cores(const HeadModel& h) {
-    std::vector<CoreCoord> extra = h.rcores;
+    std::vector<CoreCoord> extra = h.pcores;
     for (const auto& c : h.all_ports()) {
         extra.push_back(c);
     }

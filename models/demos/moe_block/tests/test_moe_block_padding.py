@@ -88,7 +88,7 @@ def mesh():
 @pytest.fixture(scope="module", params=[(0, 0), (2, 0), (0, 2)], ids=["router_once", "router_iters", "loops2"])
 def setup(mesh, request):
     router_iters, loops = request.param
-    if loops and (CHUNK // loops // R) % (32 * C):
+    if loops and (-(-CHUNK // R // (32 * C)) * 32 * C // loops) % (32 * C):
         pytest.skip(f"chunk {CHUNK} as {loops} token loops: a sub-chunk's rows a mesh row not a multiple of {32 * C}")
     mb = ttnn.experimental.moe_block
     fw = _fw()
@@ -224,11 +224,13 @@ def _padded(s, mask):
     return rows
 
 
-def _owner_rows(t, k, width=None):
+def _owner_rows(t, k, width=None, pad_rows=0):
     """per-chip [1, 1, S, W] owner rows (row-major chips; with k token loops loop-major: loop i's S/k rows, then the
-    next's) -> [CHUNK, W] in the chunk's token order: chip (r, p)'s row i S/k + t is SP row r's row i CHUNK/(R k) +
-    p S/k + t"""
-    tpc, sub = CHUNK // R, CHUNK // R // k
+    next's) -> [CHUNK, W] in the chunk's token order: chip (r, p)'s row i S/k + t is SP row r's row i tpc/k + p S/k + t
+    (tpc: an SP row's rows with the block's padding rows - pad_rows at its end, dropped)"""
+    tpc = CHUNK // R
+    tpp = tpc + pad_rows
+    sub = tpp // k
     Sk = sub // C
     out = None
     for n, d in enumerate(ttnn.get_device_tensors(t)):
@@ -237,8 +239,10 @@ def _owner_rows(t, k, width=None):
             out = torch.zeros(CHUNK, rows.shape[-1], dtype=rows.dtype)
         r, p = divmod(n, C)
         for i in range(k):
-            base = r * tpc + i * sub + p * Sk
-            out[base : base + Sk] = rows[i * Sk : (i + 1) * Sk]
+            for t_ in range(Sk):
+                pos = i * sub + p * Sk + t_
+                if pos < tpc:
+                    out[r * tpc + pos] = rows[i * Sk + t_]
     return out
 
 
@@ -259,7 +263,7 @@ def _counts(s):
 
 def _rows_words(s):
     """the routing rows [CHUNK, 2K] int64 (chunk order): a token's K ids, then K bf16 weights"""
-    return _owner_rows(s["block"].last_head.rows, s["loops"], 2 * K).to(torch.int64)
+    return _owner_rows(s["block"].last_head.rows, s["loops"], 2 * K, s["block"].pad_rows).to(torch.int64)
 
 
 def _picks(s):
@@ -301,7 +305,7 @@ def _forward(s, rows, span=None):
     x = _x(mesh, rows)
     y = block(x, s["weights"], **_span_kw(block, span))
     ttnn.synchronize_device(mesh)
-    y_own = _owner_rows(s["cap"].y_own, s["loops"])
+    y_own = _owner_rows(s["cap"].y_own, s["loops"], None, s["block"].pad_rows)
     out = dict(y_own=y_own, out=_residual(mesh, y), counts=_counts(s), picks=_picks(s), words=_rows_words(s))
     ttnn.deallocate(y)
     ttnn.deallocate(x)
@@ -395,7 +399,10 @@ def test_padded(setup):
     y = s["block"](x, s["weights"], metadata=(slot, st, en))
     ttnn.synchronize_device(s["mesh"])
     o = dict(
-        y_own=_owner_rows(s["cap"].y_own, s["loops"]), out=_residual(s["mesh"], y), counts=_counts(s), picks=_picks(s)
+        y_own=_owner_rows(s["cap"].y_own, s["loops"], None, s["block"].pad_rows),
+        out=_residual(s["mesh"], y),
+        counts=_counts(s),
+        picks=_picks(s),
     )
     _check_padded(s, ref, o, span)
     logger.info("MOE_PAD metadata=(slot_id, actual_start, actual_end): ok")
@@ -420,7 +427,12 @@ def test_padded_traced(setup):
             block.chunk_scalars(*span)  # (the same two words the capture reads)
             _clobber(s)
             ttnn.execute_trace(mesh, tid, cq_id=0, blocking=True)
-            o = dict(y_own=_owner_rows(y_own, s["loops"]), out=_residual(mesh, y), counts=_counts(s), picks=_picks(s))
+            o = dict(
+                y_own=_owner_rows(y_own, s["loops"], None, s["block"].pad_rows),
+                out=_residual(mesh, y),
+                counts=_counts(s),
+                picks=_picks(s),
+            )
             _check_padded(s, ref, o, span)
             e = _forward(s, _padded(s, real_mask(*span)), span)
             assert _same(o["y_own"], e["y_own"]) and _same(o["out"], e["out"]), f"{span}: traced vs eager"

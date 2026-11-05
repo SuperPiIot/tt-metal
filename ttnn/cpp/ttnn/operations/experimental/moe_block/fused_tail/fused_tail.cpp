@@ -123,6 +123,22 @@ Tensor fused_tail(
     return ttnn::prim::moe_block_fused_tail(params, std::move(inputs));
 }
 
+void plan_fused_tail(MoEBlockResources& resources, DataType dtype) {
+    const auto& dims = resources.dims();
+    const uint32_t rows = rows_of(resources, std::nullopt);
+    if (dims.latent_dim.has_value()) {
+        (void)make_tail_engine_plan(
+            resources,
+            rows,
+            *dims.latent_dim,
+            dims.emb_dim / resources.topology().C,
+            tile_bytes(dtype),
+            free_cb_l1_bytes(resources.mesh_device(), kL1KeptLater, kArenaMax));
+    } else {
+        (void)make_tail_a2a_plan(resources, rows, dims.emb_dim);
+    }
+}
+
 Tensor prepare_fused_tail_weights(
     const Tensor& latent_up, const Tensor& latent_norm, MoEBlockResources& resources, DataType dtype) {
     auto& mesh = resources.mesh_device();

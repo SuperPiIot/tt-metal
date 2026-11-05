@@ -57,6 +57,7 @@ HeadShape head_shape_of(
     s.rows = config.loop_tokens() / topology.R;
     s.loops = config.loops();
     s.splits = config.splits();
+    s.row_tokens = config.chunk_tokens / topology.R;  // (the caller's SP row: its real rows' closed form)
     s.H = dims.emb_dim;
     s.I = dims.shared_expert_hidden_dim.value_or(0) / topology.C;
     s.G = topology.C;
@@ -329,6 +330,9 @@ FusedHeadOutputs fused_head(
     const std::optional<Tensor>& actual_end,
     uint32_t loop) {
     using namespace fused_head_entry_detail;
+    TT_FATAL(
+        resources.config().pad_tokens == 0 || actual_start.has_value(),
+        "fused_head: a chunk with padding rows (MoEBlockConfig.pad_tokens) takes actual_start / actual_end");
     const uint32_t loops = resources.config().loops();
     TT_FATAL(
         loop < loops * resources.config().splits(),

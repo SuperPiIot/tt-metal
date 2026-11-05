@@ -68,8 +68,16 @@ empty, the chips' barrier before the next loop writes into a peer's L1. The last
 split's `k S` tokens and overlays the router's dead buffers up to the bias (`router_layout(arr_first)`: the peers'
 logits arrivals included - dead once every router core's rows are written). A forwarding port's L1 scratch is then a
 ring of `kFwdRing` slots. A padded chunk's planner counts every loop's real tokens (`rt_valid_owned`: a prefix of the
-owned order `i S + t`). `MoEBlock` picks one call wherever the chunk fits, else the fewest splits, then the fewest
-loops.
+owned order `i S + t`). Looping heads also take planner-only cores (`dataflow/planner_only.cpp`, up to `kPlannerCores`
+planner cores in the cells no head piece takes): the instances fill them first (`planner_slot`), then the router
+cores, so a split's planner does not share a router core's L1 with its 1 MB of router buffers. `MoEBlock` picks one
+call wherever the chunk fits; else the fewest splits, then of the loops that fit (head, combine, tail:
+`plan_fused_tail`) the least predicted head time.
+
+`MoEBlockConfig.pad_tokens`: a chunk whose rows a mesh row are not a multiple of 32 x TP runs with each SP row padded
+up to it (`MoEBlock` pads x and drops those rows of the output); the padding rows are a padded chunk's padding tokens
+(the head always takes actual_start / actual_end then: `(0, chunk)` when the caller has none; common arg 6 is the
+caller's SP row, `HeadShape.row_tokens`).
 
 ## Host plan
 

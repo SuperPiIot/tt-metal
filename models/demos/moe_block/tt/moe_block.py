@@ -76,6 +76,16 @@ class MoEBlock:
         self.combine = combine if combine is not None else mb.CombineConfig()
         n_acc = self.combine.n_acc
         ask = (accumulators, max_tokens_per_expert, activation, layout)
+        # (padding rows: a chunk whose rows a mesh row are not whole 32 x TP rows - the head's rows rule - runs with
+        # each SP row padded up to them; the padding rows are padding tokens of a padded chunk, their output dropped)
+        topo = resources.topology
+        rows, unit = resources.config.chunk_tokens // topo["R"], 32 * topo["C"]
+        self.pad_rows = -rows % unit
+        self.pad = self.pad_rows * topo["R"]
+        self.full_words = None  # (a chunk with padding rows and no span of the caller's: (0, chunk) device words)
+        if self.pad or resources.config.pad_tokens:
+            cfg = resources.config
+            resources.set_token_loops(cfg.token_loops, cfg.chunk_splits, self.pad)
         if resources.config.token_loops != 0:  # (the caller's loops)
             self._plan(*ask, n_acc)
         else:
@@ -124,13 +134,16 @@ class MoEBlock:
         # TP into DRAM ahead of the head, which reloads it a row chunk at a time; the plan the op runs, same l1_free)
         fit = mb.plan_fused_head(resources, dtypes, self.accumulators, l1_free)
         self.x_dram = bool(fit.ok and len(fit.planned) and fit.planned[0].lay.xdram)
+        # (the tail of a call: its L1 grows with the loop's rows - host only, uncached)
+        mb.plan_fused_tail(resources)
 
     def _plan_loops(self, ask, n_acc):
-        """The cheapest (splits, loops) whose plan fits (resources' token_loops / chunk_splits 0): one call wherever the
-        chunk plans as it is (the head's DRAM fallback included); else the fewest splits (each re-reads every expert's
-        weights), then the fewest head / tail loops - a resident head before a DRAM fallback."""
+        """The (splits, loops) to run (resources' token_loops / chunk_splits 0): one call wherever the chunk plans as it
+        is (the head's DRAM fallback included - nothing that fits changes); else the fewest splits (each re-reads every
+        expert's weights), and of their loops whose plans fit the one with the least predicted head time (k x the head
+        planner's predicted call) - a resident head before a DRAM fallback."""
         resources = self.resources
-        chunk, sp = resources.config.chunk_tokens, resources.topology["R"]
+        chunk, sp = resources.config.plan_tokens, resources.topology["R"]
         try:
             self._plan(*ask, n_acc)
             return
@@ -140,19 +153,21 @@ class MoEBlock:
         for b in [b for b in range(1, 65) if chunk % (b * sp * 32) == 0]:
             # (each chip's loop rows a whole number of tiles: x is sliced by rows)
             ks = [k for k in range(1 if b > 1 else 2, 65) if chunk % (b * k * sp * 32) == 0]
-            fallback = None
+            fits = []  # (DRAM fallback, predicted head us of the split, k)
             for k in ks:
-                resources.set_token_loops(k, b)
+                resources.set_token_loops(k, b, self.pad)
                 try:
                     self._plan(*ask, n_acc)
                 except RuntimeError as ex:
                     logger.info(f"MoEBlock: chunk {chunk} as {b} splits x {k} token loops does not fit: {_short(ex)}")
                     continue
-                if not self.x_dram:
-                    return
-                fallback = fallback or k  # (the head's DRAM fallback fits: kept unless more loops fit resident)
-            if fallback is not None:
-                resources.set_token_loops(fallback, b)
+                fit = self.mb.plan_fused_head(resources, self.dtypes, self.accumulators, self.l1_free)
+                t = k * float(fit.planned[0].t) if fit.ok and len(fit.planned) else float("inf")
+                fits.append((self.x_dram, t, k))
+                logger.info(f"MoEBlock: chunk {chunk} as {b} splits x {k} token loops: head {t:.0f} us predicted")
+            if fits:
+                _, _, k = min(fits)
+                resources.set_token_loops(k, b, self.pad)
                 self._plan(*ask, n_acc)
                 return
         raise first_error
@@ -179,6 +194,21 @@ class MoEBlock:
             f"{free} B, static CBs {static} B): {'one arena' if fits else 'two arenas (the exchange planned above them)'}"
         )
         return fits
+
+    def _words(self, a: int, b: int) -> tuple:
+        """a pair of one-word device tensors (replicated, uint32, DRAM) holding a and b"""
+        word = lambda v: torch.tensor([[[[v]]]], dtype=torch.int64)  # noqa: E731
+        return tuple(
+            ttnn.from_torch(
+                word(v),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=self.mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
+            )
+            for v in (a, b)
+        )
 
     def chunk_scalars(self, actual_start: int, actual_end: int) -> tuple:
         """The block's persistent pair of one-word device tensors (replicated, uint32, DRAM - main's metadata scalars'
@@ -235,6 +265,23 @@ class MoEBlock:
             actual_start, actual_end = self.chunk_scalars(actual_start, actual_end)
         if self.exchange_spec is None:  # (the first call, before any arena: one arena or two)
             self.one_arena = self._one_arena_fits()
+        if self.pad_rows:  # (padding rows: each chip's rows padded up to whole 32 x TP rows; their output dropped)
+            if actual_start is None:
+                if self.full_words is None:  # (made at the first call: eager - a trace captures them as they are)
+                    self.full_words = self._words(0, self.resources.config.chunk_tokens)
+                actual_start, actual_end = self.full_words
+            rows = int(x.shape[-2])
+            xp = ttnn.pad(x, [(0, 0), (0, 0), (0, self.pad_rows), (0, 0)], 0.0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            yp = self._forward_splits(xp, weights, actual_start, actual_end)
+            ttnn.deallocate(xp)
+            y = ttnn.slice(yp, [0, 0, 0, 0], [1, 1, rows, int(yp.shape[-1])], [1, 1, 1, 1],
+                           memory_config=ttnn.DRAM_MEMORY_CONFIG)  # fmt: skip
+            ttnn.deallocate(yp)
+            return y
+        return self._forward_splits(x, weights, actual_start, actual_end)
+
+    def _forward_splits(self, x, weights, actual_start, actual_end) -> ttnn.Tensor:
+        """The chunk as the block's splits (one without)."""
         if self.splits == 1:
             return self._forward(x, weights, actual_start, actual_end)
         # (splits: the whole block a piece of each chip's rows - every piece reads the experts' weights again)

@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -242,12 +243,32 @@ RoutingSizes routing_a2a_sizes(
 // The routing planner's instances on the router cores (nc of them, two RISCs each): the most instances M (<= 2 nc,
 // EPC, A, 14) whose regions (ceil(M / nc) a core, step bytes each) fit - over the router's dead buffers [0, overlay)
 // when they fit there, else past the router's bytes - in the arena. fixed_M: that many (an earlier token loop's
-// planner: the last's instances, its regions past the router's bytes).
+// planner: the last's instances over the router's local buffers [0, arr) - never the peers' logits arrivals).
+// nx (token loops): planner-only cores - their whole arena the planner's. The instances fill the planner-only cores
+// first (q < 2 nx: core q % nx, its BRISC then its NCRISC), then the router cores (q - 2 nx: core % nc, BRISC then
+// NCRISC); without planner-only cores instance q is router core q % nc's. pbase(q): its region's offset.
+struct PlannerSlot {
+    bool router;    // a router core's (else a planner-only core's)
+    uint32_t core;  // its index among the router / the planner-only cores
+    uint32_t risc;  // 0 BRISC, 1 NCRISC (its region: the core's risc-th)
+};
+inline PlannerSlot planner_slot(uint32_t q, uint32_t nc, uint32_t nx) {
+    if (q < 2 * nx) {
+        return {false, q % nx, q / nx};
+    }
+    q -= 2 * nx;
+    return {true, q % nc, q / nc};
+}
 struct PlannerPlace {
     bool ok = false;
     uint32_t M = 0;
     RoutingSizes sz{};
     int64_t step = 0, pl0 = 0;
+    uint32_t nc = 0, nx = 0;  // router cores, planner-only cores
+    int64_t pbase(uint32_t q) const {
+        const auto s = planner_slot(q, nc, nx);
+        return (s.router ? pl0 : 0) + int64_t(s.risc) * step;
+    }
 };
 PlannerPlace place_planner(
     uint32_t N,
@@ -259,7 +280,40 @@ PlannerPlace place_planner(
     int64_t overlay,
     int64_t rbytes,
     int64_t arena,
-    uint32_t fixed_M = 0);
+    uint32_t fixed_M = 0,
+    uint32_t nx = 0);
+// token loops: the planner cores a head wants (router cores and planner-only ones, two instances each)
+inline constexpr uint32_t kPlannerCores = 7;
+// The cells no head piece takes, (x, y): left of the mover column (the grid's last), past the matmul cores (GX x GY),
+// less the router cores placed under the matmul cores (the first `under` of rows GY .. by row, columns 0 .. GX); the
+// planner-only cores (token loops) are the first of them.
+inline std::vector<std::pair<uint32_t, uint32_t>> head_free_cells(
+    uint32_t grid_x, uint32_t grid_y, uint32_t GX, uint32_t GY, uint32_t under) {
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    uint32_t skipped = 0;
+    for (uint32_t y = GY; y < grid_y; ++y) {
+        for (uint32_t x = 0; x < GX; ++x) {
+            if (skipped < under) {
+                ++skipped;
+                continue;
+            }
+            out.emplace_back(x, y);
+        }
+    }
+    for (uint32_t y = 0; y < grid_y; ++y) {
+        for (uint32_t x = GX; x + 1 < grid_x; ++x) {
+            out.emplace_back(x, y);
+        }
+    }
+    return out;
+}
+// token loops: how many planner-only cores a head with nc router cores takes, of `free` free cells
+inline uint32_t planner_only_cores(uint32_t loops, uint32_t nc, size_t free) {
+    if (loops <= 1 || nc >= kPlannerCores) {
+        return 0;
+    }
+    return static_cast<uint32_t>(std::min<size_t>(free, kPlannerCores - nc));
+}
 // an earlier token loop's planner plans no token: sized for one row tile
 inline constexpr uint32_t kPlannerIdleS = 32;
 // token loops: a forwarding port's L1 scratch slots (the whole chunk's packets), reused in turn
