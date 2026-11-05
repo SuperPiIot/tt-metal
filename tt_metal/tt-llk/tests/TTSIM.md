@@ -84,6 +84,9 @@ the same file the ttnn simulator jobs use.
 and passes the matching entries to pytest as `--deselect`. A plain
 `pytest` command does not consult the file.
 
+Before adding an entry, read the rules at the top of the skip list. A
+ttsim refusal is normally fixed in the kernel or the test, not skipped.
+
 LLK entries are pytest node ids from the repo root, and they have to
 start with `tt_metal/tt-llk/tests/python_tests/`. The script drops that
 prefix, because this suite collects with `python_tests/` as its root.

@@ -1,6 +1,18 @@
 # TTSim Skip List
 # Tests that currently do not work on TTSim simulator
 #
+# Rules for new entries (cite them in review as "skip-list rule N"):
+# 1. A skip is the exception, not the fix. When ttsim refuses a test, fix the
+#    kernel or the test, or back out the change that started the refusal.
+# 2. UndefinedBehavior, UnpredictableValue and NonContractualBehavior mean the
+#    kernel or the test depends on something the hardware doesn't guarantee,
+#    even if it passes on hardware today. Fix the kernel or the test.
+# 3. If a ttsim release will add what the test needs, wait for that release and
+#    the tt_metal/ttsim-version bump instead of adding an entry.
+# 4. Every new entry has a comment directly above it with the ttsim message (or
+#    the failure, e.g. a timeout), a link to the issue that tracks it, and an
+#    "exit:" line saying what has to happen for the entry to be removed.
+#
 # Structure: Each architecture has its own section with all tests to skip.
 # Tests that apply to all architectures are duplicated in each section.
 # Paths are pytest node ids from the repo root, the same form ttnn sim legs pass
