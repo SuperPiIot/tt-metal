@@ -45,9 +45,9 @@ StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G) {
     return s;
 }
 
-uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows) {
+uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows, uint32_t tab) {
     const uint32_t MAXT = (S + A - 1) / A;
-    return align64(kTabCbBytes) + align64(rows * NT * kTile) + align64(rows * 32) + align64(MAXT * NT * 4096) +
+    return align64(tab) + align64(rows * NT * kTile) + align64(rows * 32) + align64(MAXT * NT * 4096) +
            align64(2 * NT * kTile) + align64(rows * kTile);
 }
 
@@ -72,7 +72,8 @@ CombineLayout combine_l1_layout(
     out.acc_fp32 = MAXT * pc.NT * 4096;
     out.acc_cbs = acc_cb_bytes(S, A, pc.NT, pool_slots > 0 ? kPoolRows : 2);
     out.rings = static_cast<uint32_t>(RINGS);
-    const int64_t arena = arena_bytes, acc_cbs = out.acc_cbs;
+    const int64_t arena = arena_bytes;
+    int64_t acc_cbs = out.acc_cbs;
     auto fail = [&](std::string why) {
         out.fits = false;
         out.why = std::move(why);
@@ -85,11 +86,13 @@ CombineLayout combine_l1_layout(
     // (the landing pool on the flat cores: each accumulator's share of their slots, nothing in its own L1)
     const bool flat_pool = pool_slots > 0;
     const int64_t fit = flat_pool ? static_cast<int64_t>(pool_slots / A) : fdiv(arena - RINGS - acc_cbs - keep, SLOT);
-    if (shared && acc_on_ports) {
-        return fail("shared landing: the accumulators apart from the ports only");
+    const int64_t psl_cap =
+        !shared ? std::numeric_limits<int64_t>::max() : int64_t(flat_pool ? kSharedFlatPslMax : kSharedPslMax);
+    const int64_t PSL = std::min<int64_t>({static_cast<int64_t>(depth) * (N - 1), fit, psl_cap});
+    if (shared && flat_pool) {  // (CB_TAB holds the pool's owners / free list: sized by it)
+        out.acc_cbs = acc_cb_bytes(S, A, pc.NT, kPoolRows, acc_tab_bytes(true, static_cast<uint32_t>(PSL)));
+        acc_cbs = out.acc_cbs;
     }
-    const int64_t PSL = std::min<int64_t>(
-        {static_cast<int64_t>(depth) * (N - 1), fit, shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
     out.PSL = static_cast<int32_t>(PSL);
     out.D = N > 1 ? static_cast<int32_t>(fdiv(PSL, N - 1)) : 0;
     out.has_PSL = true;
@@ -160,10 +163,6 @@ CombineAuto combine_auto(
         const int64_t A = std::min<int64_t>(a_max, cells);
         const char* name = fused ? "acc_on_ports" : "ports apart";
         if (mode.has_value() && *mode != (fused ? CombineMode::AccOnPorts : CombineMode::PortsApart)) {
-            continue;
-        }
-        if (shared && fused) {  // (shared landing: the accumulators apart from the ports only)
-            why.push_back(fmt::format("{}: not with the shared landing", name));
             continue;
         }
         if (A < 1 || (fused && static_cast<int64_t>(port_cells) > A)) {

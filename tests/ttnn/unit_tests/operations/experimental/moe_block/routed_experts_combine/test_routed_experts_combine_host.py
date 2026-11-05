@@ -60,15 +60,22 @@ def test_auto_invariants():
 
 
 def test_auto_shared_landing():
-    """The shared landing pool: accumulators apart from the ports only, the pool under 255 slots (slot owners are
-    bytes), the grant rings' state no larger than rings' by more than the grant words and snapshots."""
+    """The shared landing pool, accumulators apart from or on the ports: in the accumulators' L1 under 255 slots an
+    accumulator, on the flat cells (SharedFlatCores) up to 1024; the grant rings' state no larger than rings' by more
+    than the grant words and snapshots."""
     for (N, S, W), arena in itertools.product(SHAPES, ARENAS):
         for cells, ports in ((19, 8), (30, 8)):
-            got = mb.combine_auto(N, S, W, cells, ports, arena_bytes=arena, landing=mb.CombineLanding.Shared)
-            if not got["fits"]:
-                assert got["why"]
-                continue
-            lay = got["layout"]
-            assert got["shared"] and not got["acc_on_ports"] and "acc_on_ports" not in got["modes"]
-            assert lay["fits"] and N - 1 <= lay["PSL"] <= 254
-            assert max(lay["acc_used"], lay["port_used"]) <= arena
+            for landing, pool, cap in (
+                (mb.CombineLanding.Shared, 0, 254),
+                (mb.CombineLanding.SharedFlatCores, 20000, 1024),
+            ):
+                got = mb.combine_auto(
+                    N, S, W, cells, ports, arena_bytes=arena, landing=landing, pool_slots=pool, depth=64
+                )
+                if not got["fits"]:
+                    assert got["why"]
+                    continue
+                lay = got["layout"]
+                assert got["shared"]
+                assert lay["fits"] and N - 1 <= lay["PSL"] <= cap
+                assert max(lay["acc_used"], lay["port_used"]) <= arena

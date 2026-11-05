@@ -26,8 +26,8 @@ struct CombineConfig {
     std::optional<CombineMode> mode;    // ... and its mode
     uint32_t arena_bytes = 0;           // the combine's L1 budget a core; 0: the reference's sizing at the first call
     uint32_t depth = 8;                 // landing pool slots per source chip (average)
-    // the landing pool: rings (one a source chip) or shared (slot grants; accumulators apart from the ports);
-    // nullopt: the planner's (rings)
+    // the landing pool: rings (one a source chip) or shared (slot grants), in the accumulators' L1 or on the flat
+    // cells; nullopt: the planner's (rings, ranked by combine_choice_key)
     std::optional<CombineLanding> landing;
     // credit / grant snapshots: rows a snapshot covers before it goes back (1: at once); nullopt: the planner's (8 with
     // >= 16 sources, else at most half a source's slots, shared at once)

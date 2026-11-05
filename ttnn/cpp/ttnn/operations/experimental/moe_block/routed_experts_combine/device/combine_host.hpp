@@ -36,7 +36,8 @@ inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off write
 // shared landing: slot grants outstanding a (source, accumulator) at most (4: 2x4 GLM-5.3-Flash 1280 experts + combine
 // 560 / 694 / 1157 us at D 8 / 2 / 1 vs 584 / 688 / 1172 at 8, 591 / 699 / 1194 at 16)
 inline constexpr uint32_t kGrants = 4;
-inline constexpr uint32_t kSharedPslMax = 254;  // shared landing: slot owners are bytes (0xFF: free)
+inline constexpr uint32_t kSharedPslMax = 254;  // shared landing in the accumulators' L1: slots an accumulator at most
+inline constexpr uint32_t kSharedFlatPslMax = 1024;  // ... on the flat cells (slot ids 16-bit, owners bytes)
 
 // Plan tensor word offsets (common/combine_plan_words.hpp, shared with the kernels).
 inline constexpr uint32_t kPlanWords = moe_block_plan_words::kPlanWords;
@@ -67,7 +68,12 @@ struct StateLayout {
 StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G = 0);
 
 // _acc_cbs: an accumulator's CB bytes (CB_TAB, CB_ROW, CB_META, CB_ACC, CB_OUT, CB_W; each 64 B aligned).
-uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows = 2);
+uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows = 2, uint32_t tab = kTabCbBytes);
+// an accumulator's CB_TAB bytes: the shared landing's slot owners (1 B) and free list (2 B a slot) last
+// (accumulator_reader.cpp: plan words, grant queues, trailer probes, zeros, then them from 1600 B)
+inline uint32_t acc_tab_bytes(bool shared, uint32_t psl) {
+    return shared ? std::max<uint32_t>(kTabCbBytes, align64(1600 + 4 + 3 * psl + 64)) : kTabCbBytes;
+}
 // the accumulator's row CB depth (rows, its meta and weight CBs too) with the rings on the flat cells: its row reads
 // cross the NoC, kPoolRows of them in flight
 inline constexpr uint32_t kPoolRows = 4;
@@ -107,13 +113,13 @@ enum class CombineMode : uint8_t { PortsApart = 0, AccOnPorts = 1 };
 // The landing pool at an accumulator: Rings - carved per call into one ring per source chip (a source's rows go to its
 // ring's next slot, credits return consumed slots); Shared - one free list, the accumulator grants specific slots to
 // the sources with rows pending (ids ride the credit snapshots, tag-validated), so a burst from one source uses slots
-// another source's ring would hold empty. Shared: accumulators apart from the ports only. FlatCores - rings as Rings,
+// another source's ring would hold empty (accumulators apart from or on the ports). FlatCores - rings as Rings,
 // their slots in the flat expert cores' free L1 (each flat core's arena past the flat plan's bytes) instead of the
 // accumulator's: the accumulator keeps only its fp32 sums and CBs there, it learns a row landed by reading the slot's
 // trailer and takes the row with a NoC read (as it takes a local slot's), so deep rings cost the accumulators nothing.
 // (pool_slots: the flat cores' slots a chip, every accumulator's rings carved from them; 0 - in the accumulators' L1)
-// SharedFlatCores - Shared's slot grants, the slots in the flat cores' free L1 as FlatCores' (accumulators apart from
-// the ports only).
+// SharedFlatCores - Shared's slot grants, the slots in the flat cores' free L1 as FlatCores' (up to kSharedFlatPslMax
+// slots an accumulator).
 enum class CombineLanding : uint8_t { Rings = 0, Shared = 1, FlatCores = 2, SharedFlatCores = 3 };
 inline bool landing_shared(CombineLanding l) {
     return l == CombineLanding::Shared || l == CombineLanding::SharedFlatCores;

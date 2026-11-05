@@ -329,7 +329,7 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     plan->st = state_layout(N, A, plan->shared ? kGrants : 0);
     const uint32_t SLOT = plan->pc.slot, ISLOT = SLOT;
     plan->row_depth = flat_pool ? kPoolRows : 2u;
-    const uint32_t acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT, plan->row_depth);
+    uint32_t acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT, plan->row_depth);
     const uint32_t QP0 = au.best->inj_slots, keep_slots = au.best->local_keep;
     const int64_t keep = plan->fused ? static_cast<int64_t>(keep_slots + std::min(32u, QP0)) * ISLOT
                                      : static_cast<int64_t>(keep_slots) * ISLOT;
@@ -338,11 +338,13 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     const int64_t PSL = std::min<int64_t>(
         {static_cast<int64_t>(in.depth) * (N - 1),
          fit,
-         plan->shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
+         !plan->shared ? std::numeric_limits<int64_t>::max() : int64_t(flat_pool ? kSharedFlatPslMax : kSharedPslMax)});
     TT_FATAL(
         PSL >= static_cast<int64_t>(N) - 1, "routed_experts_combine: no room for one landing slot per source chip");
     TT_FATAL(PSL < 4096, "routed_experts_combine: a ring's base / depth are 12-bit fields");
     plan->PSL = static_cast<uint32_t>(PSL);
+    plan->tab_acc = acc_tab_bytes(plan->shared, plan->PSL);
+    acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT, plan->row_depth, plan->tab_acc);
     plan->D = N > 1 ? plan->PSL / (N - 1) : 0;
     plan->cred = credit_policy(N, plan->D, plan->shared, in.credit_batch);
     const uint32_t acc_area = plan->st.RINGS + (flat_pool ? 0u : plan->PSL * SLOT);
@@ -379,7 +381,7 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
         return o;
     };
     const uint32_t NT = plan->pc.NT;
-    plan->tab_off_acc = take(kTabCbBytes);
+    plan->tab_off_acc = take(plan->tab_acc);
     plan->row_off = take(plan->row_depth * NT * kTile);
     plan->meta_off = take(plan->row_depth * 32);
     plan->acc_off = take(plan->MAXT * NT * 4096);
@@ -501,7 +503,7 @@ CombineHandles add_combine_program(
         }
         arena_cb(kCbTab, cores_of(only_ports), plan.tab_off_port, kTabCbBytes, tt::DataFormat::UInt32, kTabCbBytes);
     }
-    arena_cb(kCbTab, aset, plan.tab_off_acc, kTabCbBytes, tt::DataFormat::UInt32, kTabCbBytes);
+    arena_cb(kCbTab, aset, plan.tab_off_acc, plan.tab_acc, tt::DataFormat::UInt32, plan.tab_acc);
     arena_cb(kCbRow, aset, plan.row_off, plan.row_depth * NT * kTile, tt::DataFormat::Float16_b, kTile);
     arena_cb(kCbMeta, aset, plan.meta_off, plan.row_depth * 32, tt::DataFormat::UInt32, 32);
     arena_cb(kCbAcc, aset, plan.acc_off, plan.MAXT * NT * 4096, tt::DataFormat::Float32, 4096);

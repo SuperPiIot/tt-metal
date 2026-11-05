@@ -92,6 +92,7 @@ struct CombinePlan {
     bool flat_pool = false;
     uint32_t pool_slots = 0;
     uint32_t row_depth = 2;  // the accumulators' row / meta / weight CBs (rows): kPoolRows with flat_pool
+    uint32_t tab_acc = kTabCbBytes;  // the accumulators' CB_TAB bytes (acc_tab_bytes)
     std::vector<uint32_t> pool_args;
     CreditPolicy cred;
     CombineAutoChoice choice;

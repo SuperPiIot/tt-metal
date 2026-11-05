@@ -68,7 +68,7 @@ void bind_routed_experts_combine(nb::module_& mod) {
         accumulator count and mode the fused head planned; arena_bytes is the combine's L1 budget a core (0: the
         exchange's sizing from the largest free L1 block at the first call, less the flat program's static CBs and the
         dispatch's); depth is the landing pool's slots per source chip; landing: a CombineLanding (Rings: one ring a
-        source chip; Shared: slot grants from one free list, accumulators apart from the ports; FlatCores: rings in the
+        source chip; Shared: slot grants from one free list; FlatCores: rings in the
         flat expert cells' free L1; SharedFlatCores: Shared's grants on FlatCores' slots), None the planner's (rings in
         the accumulators' L1 or on the flat cells, ranked by combine_choice_key). A row travels as one fabric packet with
         its 32 B trailer.

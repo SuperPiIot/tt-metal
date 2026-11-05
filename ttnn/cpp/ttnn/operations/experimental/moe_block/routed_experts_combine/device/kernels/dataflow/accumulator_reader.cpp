@@ -41,7 +41,7 @@ constexpr auto plan_args = TensorAccessorArgs<CMB_PLAN_CT>();  // (the device pl
 constexpr uint32_t LASTPB = row_bytes;  // the row's 32 B trailer (one fabric packet a row)
 #ifdef REC_SHARED
 constexpr uint32_t SHARED = 1, G = REC_G, GIDH = REC_GIDH;
-static_assert(PSL <= 254, "shared landing: slot owners are bytes (0xFF: free)");
+static_assert(PSL <= 1024, "shared landing: slot ids 16-bit, the owners / free list in CB_TAB (acc_tab_bytes)");
 #else
 constexpr uint32_t SHARED = 0, G = 1, GIDH = 0;
 #endif
@@ -105,7 +105,7 @@ void kernel_main() {
     const uint32_t sc = (get_write_ptr(cb_tab) + 63) & ~63u;  // (CB_TAB: scratch - the plan's words, the free list)
     uint32_t n_local = 0;
     {  // (the device plan: n_local and want[] of this accumulator)
-        namespace pw = moe_block_plan_words;  // (n_local[kAccMax] at sc, want[me] at sc + 128: below own[] at sc + 256)
+        namespace pw = moe_block_plan_words;  // (n_local[kAccMax] at sc, want[me] at sc + 128: below gq at sc + 256)
         const uint64_t plan_noc = TensorAccessor(plan_args, plan, pw::kPlanBytes).get_noc_addr(0);
         noc_async_read(plan_noc + pw::kPlanNloc * 4, sc, 4 * pw::kAccMax);  // n_local[kAccMax]
         noc_async_read(plan_noc + (pw::kPlanWant + me * pw::kMaxChips) * 4, sc + 4 * pw::kAccMax, 128);  // want[me]
@@ -185,15 +185,19 @@ void kernel_main() {
     }
     // shared: each slot's owner (source, 0xFF free) and the free list in CB_TAB's scratch past the plan's words; per
     // source the grants outstanding and issued this call
-    volatile tt_l1_ptr uint8_t* own = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(sc + 256);
-    volatile tt_l1_ptr uint16_t* fstack = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 512);
+    // (CB_TAB from sc: the plan's words, the grant queues at 256 (2 N G B), the trailer probes at 512 (<= 1 KB), 32 B
+    // of zeros at 1536, the owners at 1600 (PSL B), the free list after them (2 PSL B) - acc_tab_bytes)
+    volatile tt_l1_ptr uint8_t* own = reinterpret_cast<volatile tt_l1_ptr uint8_t*>(sc + 1600);
+    volatile tt_l1_ptr uint16_t* fstack =
+        reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 1600 + ((PSL + 3u) & ~3u));
     // a source's granted slots in grant order - it fills them in that order (one port, one path), so its oldest
     // outstanding grant, at (issued - outstanding) % G, is the only one to check
-    volatile tt_l1_ptr uint16_t* gq = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 1024);
+    volatile tt_l1_ptr uint16_t* gq = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 256);
+    static_assert(2 * N * G <= 256, "shared landing: the grant queues in CB_TAB");
     // (REC_POOL: each source's next slots' trailers, 32 B a slot - past the shared landing's grant queues; then 32 B of
     // zeros, a taken slot's trailer)
-    const uint32_t probe = SHARED ? sc + 1280 : sc + 1024;
-    const uint32_t zero32 = SHARED ? sc + 2304 : sc + 2048;
+    const uint32_t probe = sc + 512;
+    const uint32_t zero32 = sc + 1536;
     if constexpr (POOL) {
         for (uint32_t w = 0; w < 8; ++w) {
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zero32)[w] = 0;

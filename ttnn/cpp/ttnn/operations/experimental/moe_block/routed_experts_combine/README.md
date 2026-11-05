@@ -25,7 +25,8 @@ accumulators).
   CBs and deeper local / injection rings. The accumulator probes its slots' trailers
   (32 B reads, several slots a source at once), reads landed rows over the NoC (`kPoolRows` in flight) and clears a
   taken slot's trailer before its credit goes back. `CombineLanding.SharedFlatCores`: the shared landing's slot grants
-  on those slots (accumulators apart from the ports). With no `CombineConfig.landing` the planner plans the rings both
+  on those slots (up to 1024 an accumulator; the shared landing runs with the accumulators apart from or on the
+  ports). With no `CombineConfig.landing` the planner plans the rings both
   ways and keeps the higher `combine_choice_key`: landing depth up to 3 slots a source, then at least half the most
   accumulators, then the injection ring (to 64), then deeper landing, accumulators, the local ring - the same ranking
   picks between accumulators on / apart from the ports. A port sends any row of the first 32 of its
