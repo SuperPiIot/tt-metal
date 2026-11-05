@@ -8,6 +8,13 @@ import torch
 
 import ttnn
 from tests.ttnn.utils_for_testing import assert_equal
+from tests.ttnn.unit_tests.operations.data_movement.docstring_support import (
+    assert_exact,
+    docstring_dtype_layout_params,
+    docstring_interleaved_buffer_type_params,
+    interleaved_memory_config,
+    torch_input,
+)
 
 
 @pytest.mark.parametrize("repeats", [1, 2, 3, 58])
@@ -113,3 +120,20 @@ def test_repeat_interleave_with_repeat_tensor(device):
     output = ttnn.to_torch(output)
 
     assert_equal(torch_result, output)
+
+
+@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.repeat_interleave))
+@pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.repeat_interleave))
+def test_repeat_interleave_docstring_supported_inputs(dtype, layout, buffer_type, device):
+    """Runs every dtype, layout and interleaved buffer type the ttnn.repeat_interleave docstring lists."""
+    memory_config = interleaved_memory_config(buffer_type)
+    input_tensor = ttnn.from_torch(
+        torch_input((2, 3, 32, 64), dtype), dtype=dtype, layout=layout, device=device, memory_config=memory_config
+    )
+    # Repeating an outer dimension keeps block-float values unchanged.
+    output = ttnn.repeat_interleave(input_tensor, 2, dim=1, memory_config=memory_config)
+
+    assert output.dtype == dtype
+    assert output.layout == layout
+    assert output.memory_config().buffer_type == buffer_type
+    assert_exact(torch.repeat_interleave(ttnn.to_torch(input_tensor), 2, dim=1), ttnn.to_torch(output))
