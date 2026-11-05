@@ -41,6 +41,8 @@ void bind_permute(nb::module_& mod) {
                  - Layouts
                * - BFLOAT16, FLOAT32, INT32, UINT32
                  - TILE, ROW_MAJOR
+               * - UINT8
+                 - ROW_MAJOR
                * - BFLOAT8_B
                  - TILE
 
