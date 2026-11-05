@@ -614,3 +614,84 @@ def test_typecast_host_tensor(output_dtype, preferred_layout, device):
     elif output_dtype == ttnn.bfloat16:
         torch_expected = torch_tensor.to(tt_dtype_to_torch_dtype[output_dtype])
         assert_with_ulp(expected_result=torch_expected, actual_result=torch_output, ulp_threshold=2)
+
+
+@pytest.mark.parametrize(
+    "input_dtype,output_dtype",
+    [
+        (ttnn.bfloat16, ttnn.float32),
+        (ttnn.bfloat16, ttnn.int32),
+        (ttnn.uint8, ttnn.bfloat16),
+    ],
+    ids=["BFLOAT16_TO_FLOAT32", "BFLOAT16_TO_INT32", "UINT8_TO_BFLOAT16"],
+)
+def test_typecast_row_major_padded_input_from_untilize(input_dtype, output_dtype, device):
+    """Regression for #63647: RM typecast on an operand whose padded_shape != logical_shape
+    (e.g. ttnn.untilize of a height-sharded TILE input into DRAM) read tile-padding rows into
+    the output and wrote past the output's end. Validate values and bracket the output in DRAM
+    with guard tensors; neither guard should change."""
+    height_sharded = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+        ttnn.BufferType.L1,
+        ttnn.ShardSpec(
+            ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0))}),
+            [32, 32],
+            ttnn.ShardOrientation.ROW_MAJOR,
+        ),
+    )
+
+    S = 16  # logical H, padded to 32 by the TILE-sharded layout
+    shape = [2, 1, S, 32]
+    torch.manual_seed(63647)
+    if input_dtype == ttnn.uint8:
+        torch_input = torch.randint(0, 256, shape, dtype=torch.uint8)
+    else:
+        torch_input = torch.randn(shape, dtype=torch.bfloat16)
+
+    tile = ttnn.from_torch(
+        torch_input,
+        dtype=input_dtype,
+        layout=ttnn.TILE_LAYOUT,
+        pad_value=-7.0 if input_dtype == ttnn.bfloat16 else 0,
+        device=device,
+        memory_config=height_sharded,
+    )
+    x = ttnn.untilize(tile, memory_config=ttnn.DRAM_MEMORY_CONFIG, use_multicore=True)
+    assert list(x.padded_shape) == [2, 1, 32, 32]
+    assert list(x.shape) == shape
+
+    # Place the output between two guard tensors in DRAM so an out-of-bounds write is detectable.
+    GUARD = -3.0
+    guard_host = torch.full(shape, GUARD, dtype=torch.float32)
+    guard_a = ttnn.from_torch(
+        guard_host,
+        dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    holder = ttnn.allocate_tensor_on_device(
+        ttnn.Shape(shape), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, device, ttnn.DRAM_MEMORY_CONFIG
+    )
+    guard_b = ttnn.from_torch(
+        guard_host,
+        dtype=ttnn.float32,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    ttnn.deallocate(holder)
+
+    y = ttnn.typecast(x, output_dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.synchronize_device(device)
+
+    torch_y = ttnn.to_torch(y).reshape(shape)
+    expected = torch_input.to(tt_dtype_to_torch_dtype[output_dtype])
+    if output_dtype in INTEGER_OUTPUT_DTYPES:
+        assert torch.equal(torch_y, expected), "padded-RM typecast values diverge"
+    else:
+        assert_with_ulp(expected_result=expected.to(torch_y.dtype), actual_result=torch_y, ulp_threshold=2)
+
+    for name, g in (("guard_a", guard_a), ("guard_b", guard_b)):
+        g_torch = ttnn.to_torch(g)
+        assert torch.equal(g_torch, guard_host.to(g_torch.dtype)), f"{name} overwritten by typecast"
