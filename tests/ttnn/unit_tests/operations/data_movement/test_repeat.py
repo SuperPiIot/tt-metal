@@ -294,3 +294,10 @@ def test_repeat_docstring_supported_inputs(dtype, layout, buffer_type, device):
     assert list(ttnn.repeat(input_tensor, [1, 0, 1, 1]).shape) == [1, 0, 32, 32]
     # With memory_config=None, an interleaved input keeps its memory configuration.
     assert ttnn.repeat(input_tensor, [1, 2, 1, 1]).memory_config() == memory_config
+
+    # A shape that is not tile-aligned.
+    unaligned = ttnn.from_torch(
+        torch_input((1, 1, 30, 30), dtype), dtype=dtype, layout=layout, device=device, memory_config=memory_config
+    )
+    output = ttnn.repeat(unaligned, [1, 2, 1, 2], memory_config=memory_config)
+    assert_exact(ttnn.to_torch(unaligned).repeat(1, 2, 1, 2), ttnn.to_torch(output))
