@@ -9,6 +9,19 @@
 
 #include "ttnn/cpp/ttnn/operations/experimental/moe_block/fused_head/device/kernels/ra_accessors.hpp"
 
+// RA_FWD_PAR (token loops: consecutive head calls, a chip at most one call ahead of another): a forwarder's DRAM pages
+// and flags per call parity - RA_FPAGES pages and RA_NF_ flags a parity, a landed counter a parity at flag 2 RA_NF_ +
+// par, the forwarder's own call count at flag 2 RA_NF_ + 2 - so a chip a call ahead never overwrites a packet the
+// forwarder has not sent on yet
+#ifdef RA_FWD_PAR
+constexpr uint32_t ra_fpar_page(uint32_t par) { return par * RA_FPAGES; }
+constexpr uint32_t ra_fpar_flag(uint32_t par) { return par * RA_NF_; }
+constexpr uint32_t ra_fpar_ctr(uint32_t par) { return 2 * RA_NF_ + par; }
+#else
+constexpr uint32_t ra_fpar_page(uint32_t) { return 0; }
+constexpr uint32_t ra_fpar_flag(uint32_t) { return 0; }
+constexpr uint32_t ra_fpar_ctr(uint32_t) { return RA_NF_; }
+#endif
 // one packet's way on: to the next hop (kind 0: the destination's DRAM slot page par N + src, its arrival counter on
 // planner core 0; kind 1: the next forwarding port's DRAM slot page (fbase: the forward slots tensor, slot | page <<
 // 8), its flag on that port), chunks of MAXP, the last with the increment. (A forward slot in DRAM, not the port's L1:
@@ -42,8 +55,8 @@ FORCE_INLINE void ra_hop(
         dst = TensorAccessor(ra_acc::slots, sl, PCAP).get_noc_addr(par * RA_N + srcid);
         inc = get_noc_addr(px, py, par ? c1 : c0);
     } else {
-        dst = TensorAccessor(ra_acc::fslots, fbase, PCAP).get_noc_addr(slot >> 8);
-        inc = get_noc_addr(nx, ny, flags + 16 * (slot & 0xFF));
+        dst = TensorAccessor(ra_acc::fslots, fbase, PCAP).get_noc_addr((slot >> 8) + ra_fpar_page(par));
+        inc = get_noc_addr(nx, ny, flags + 16 * ((slot & 0xFF) + ra_fpar_flag(par)));
     }
     for (uint32_t off = 0; off < bytes; off += MAXP) {
         const uint32_t sz = bytes - off < MAXP ? bytes - off : MAXP;
@@ -61,7 +74,7 @@ FORCE_INLINE void ra_hop(
     if (kind == 1) {  // (+1 on the next forwarder's landed count, behind the packet: its poll reads one word)
         noc_async_writes_flushed();
         hdr->to_noc_unicast_atomic_inc(
-            NocUnicastAtomicIncCommandHeader{get_noc_addr(nx, ny, flags + 16 * RA_NF_), 1, true});
+            NocUnicastAtomicIncCommandHeader{get_noc_addr(nx, ny, flags + 16 * ra_fpar_ctr(par)), 1, true});
         conn.wait_for_empty_write_slot();
         conn.send_payload_flush_blocking_from_address(reinterpret_cast<uint32_t>(hdr), sizeof(PACKET_HEADER_TYPE));
     }
@@ -174,15 +187,12 @@ struct RASend {
 };
 // RA_FWD_RING (token loops): the forwarder's L1 scratch slots, reused in turn once the slot's last packet left (else
 // one a packet)
-#ifndef RA_FWD_RING
-#define RA_FWD_RING RA_NF_
-#endif
 // a forwarding port's slots: each packet (of another chip, on its way) landed in its DRAM slot page with its flag set -
 // read into the scratch slot (L1, this program's) and sent on to its next hop (any order), the flag re-armed. args at
 // r0: n, scratch base, flags, PCAP, slot tensor, c0, c1, planner core 0 (x, y), mesh, the forward slots tensor, this
 // port's first page, then per slot (next chip, kind, x, y, slot | page << 8)
 struct RAFwd {
-    uint32_t r0, n, fb, fl, PCAP, sl, c0, c1, px, py, mesh, fd, pg0, left, lastc;
+    uint32_t r0, n, fb, fl, PCAP, sl, c0, c1, px, py, mesh, fd, pg0, left, lastc, fpar = 0;
     uint32_t sent[RA_NF_];
     void init(uint32_t a) {
         r0 = a;
@@ -206,6 +216,14 @@ struct RAFwd {
         for (uint32_t k = 0; k < RA_NF_; ++k) {
             sent[k] = 0;
         }
+#ifdef RA_FWD_PAR
+        {  // (my call's parity: my own count of calls, past the flags)
+            volatile tt_l1_ptr uint32_t* cf =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fl + 16 * (2 * RA_NF_ + 2));
+            fpar = cf[0] & 1;
+            cf[0] = cf[0] + 1;
+        }
+#endif
     }
     static uint32_t len(uint32_t a) {
         const uint32_t n = get_arg_val<uint32_t>(a);
@@ -215,7 +233,7 @@ struct RAFwd {
     void poll(C& conn, H hdr, bool blocking, uint32_t RA_N, uint32_t RA_M, uint32_t RA_HBP, uint32_t MAXP) {
         // (the landed count - one increment a packet, behind its data and flag - says when a scan of the flags can find
         // something: a poll between the other streams' packets reads one word)
-        volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fl + 16 * RA_NF_);
+        volatile tt_l1_ptr uint32_t* ctr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fl + 16 * ra_fpar_ctr(fpar));
         while (left) {
             bool any = false;
             invalidate_l1_cache();
@@ -228,17 +246,21 @@ struct RAFwd {
             }
             lastc = c;
             for (uint32_t k = 0; k < n; ++k) {
-                volatile tt_l1_ptr uint32_t* f = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fl + 16 * k);
+                volatile tt_l1_ptr uint32_t* f =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(fl + 16 * (k + ra_fpar_flag(fpar)));
                 if (sent[k] || *f == 0) {
                     continue;
                 }
                 DeviceZoneScopedN("SE-RAFWD");
+#ifdef RA_FWD_RING
                 const uint32_t pb = fb + (k % RA_FWD_RING) * PCAP;
+                noc_async_writes_flushed();  // (the slot's last packet has left its L1)
+#else
+                const uint32_t pb = fb + k * PCAP;
+#endif
                 {
-                    if constexpr (RA_FWD_RING < RA_NF_) {
-                        noc_async_writes_flushed();  // (the slot's last packet has left its L1)
-                    }
-                    noc_async_read(TensorAccessor(ra_acc::fslots, fd, PCAP).get_noc_addr(pg0 + k), pb, PCAP);
+                    noc_async_read(
+                        TensorAccessor(ra_acc::fslots, fd, PCAP).get_noc_addr(pg0 + k + ra_fpar_page(fpar)), pb, PCAP);
                     noc_async_read_barrier();
                     invalidate_l1_cache();
                 }

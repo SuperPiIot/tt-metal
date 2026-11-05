@@ -251,7 +251,7 @@ public:
     uint32_t HS = 16, fslots = 16, lw_off = 0, port_words = 16, zw_off = 0, mbox_words = 0;
     // routing
     uint32_t S = 0, SA = 0, loops = 1, splits = 1, EPC = 0, A = 0, Lr = 2, M = 0, NF = 16, rows_cap = 0, inst_cap = 0;
-    int64_t pl_step = 0, plan_l1 = 0, HBP = 0, BB = 0, BBP = 0, PCAP = 0, MAXP = 0;
+    int64_t HBP = 0, BB = 0, BBP = 0, PCAP = 0, MAXP = 0;
     std::vector<int64_t> pbases_off;  // the planner instances' regions, arena offsets
     // token loops: an earlier loop's planner (no token): its instances' regions past the router's bytes, its caps
     std::vector<int64_t> pbases_idle;
@@ -802,7 +802,9 @@ std::shared_ptr<const HeadModel> make_head_model(
     h.HS = config.handoff_bytes;
     const auto rt = routing_paths(h.R, G, h.ring, h.wrap_y, h.L);
     h.fslots = std::max<uint32_t>(16, std::holds_alternative<RoutingPaths>(rt) ? std::get<RoutingPaths>(rt).nf : 16);
-    h.lw_off = (2 * GX * GY * h.HS / 4 + 4 * 8 + 4 * h.fslots + 4 + 3) / 4 * 4;
+    // (the forwarders' flags: a word a slot, then the landed count; token loops: both a call parity, + the call count)
+    const uint32_t fwd_words = sh.loops > 1 ? 4 * (2 * h.fslots + 3) : 4 * h.fslots + 4;
+    h.lw_off = (2 * GX * GY * h.HS / 4 + 4 * 8 + fwd_words + 3) / 4 * 4;
     const uint32_t nrc = nrt;
     h.port_words = std::max<uint32_t>(16, (G - 1) * u32(cdiv(nrc, h.L)));
     h.zw_off = h.lw_off + 4 * h.port_words;
@@ -849,8 +851,6 @@ std::shared_ptr<const HeadModel> make_head_model(
         TT_FATAL(pp.ok, "fused_head: routing planner: no room ({})", pp.sz.why);
         h.M = pp.M;
         h.inst_cap = u32(pp.sz.inst_cap);
-        h.plan_l1 = pp.sz.plan_l1;
-        h.pl_step = pp.step;
         for (uint32_t q = 0; q < h.M; ++q) {
             h.pbases_off.push_back(pp.pbase(q));
         }
@@ -2194,6 +2194,10 @@ void ChipProgram::routing_defines(KernelDescriptor& k) const {
     if (h.fwd_ring) {
         define(k, "RA_FWD_RING", iv(h.fwd_ring));
     }
+    if (h.loops > 1) {  // (token loops: the forward pages and flags a call parity - ra_send.hpp)
+        define(k, "RA_FWD_PAR");
+        define(k, "RA_FPAGES", iv(std::max<uint32_t>(1, u32(h.fkeys.size())) * h.NF));
+    }
 }
 
 // router_stream._ra_src: the planner as ra::plan (RAP_* = RoutingStream.kernel_subs)
@@ -2784,7 +2788,7 @@ HeadTensorShapes head_tensor_shapes(const HeadModel& h) {
     s.route_words = route_words(h.N) * h.SA;
     s.slot_words = u32(h.PCAP / 4);
     s.slots_rows = 2 * h.N;
-    s.fslots_rows = std::max<uint32_t>(1, u32(h.fkeys.size())) * h.NF;
+    s.fslots_rows = std::max<uint32_t>(1, u32(h.fkeys.size())) * h.NF * (h.loops > 1 ? 2 : 1);
     const uint32_t NG = h.N * h.EPC;
     s.plan_outs = {{{1, NG}, {1, NG}, {1, h.rows_cap}, {h.rows_cap / 32, 64}, {1, kPlanWords}}};
     s.arena_bytes = u32(h.arena_bytes);

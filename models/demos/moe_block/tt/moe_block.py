@@ -63,6 +63,7 @@ class MoEBlock:
         layout=None,
         combine=None,
         l1_free: Optional[int] = None,
+        tail_dtype=None,
     ):
         mb = ttnn.experimental.moe_block
         # (the ops' persistent words and semaphores live across calls: in L1_SMALL, where no other program's circular
@@ -71,6 +72,7 @@ class MoEBlock:
         assert resources.config.persist_l1_small, "MoEBlock: create its resources with persist_l1_small=True"
         self.mb, self.mesh_device, self.resources, self.dtypes = mb, mesh_device, resources, dtypes
         self.l1_free = l1_free
+        self.tail_dtype = ttnn.bfloat8_b if tail_dtype is None else tail_dtype  # (a latent model's W_up tiles)
         if layout is None:
             layout = mb.FlatLayoutOptions()
         self.combine = combine if combine is not None else mb.CombineConfig()
@@ -86,10 +88,11 @@ class MoEBlock:
         if self.pad or resources.config.pad_tokens:
             cfg = resources.config
             resources.set_token_loops(cfg.token_loops, cfg.chunk_splits, self.pad)
-        if resources.config.token_loops != 0:  # (the caller's loops)
+        cfg = resources.config
+        if cfg.token_loops != 0 and cfg.chunk_splits != 0:  # (the caller's loops and splits)
             self._plan(*ask, n_acc)
         else:
-            self._plan_loops(ask, n_acc)
+            self._plan_loops(ask, n_acc, fixed_k=cfg.token_loops, fixed_b=cfg.chunk_splits)
         self.loops = max(1, int(resources.config.token_loops))
         self.splits = max(1, int(resources.config.chunk_splits))
         logger.info(
@@ -114,7 +117,13 @@ class MoEBlock:
         cap = max(resources.config.split_tokens, 256)
         self.combine.n_acc = n_acc
         self.expert_kw = dict(
-            max_tokens_per_expert=cap if max_tokens_per_expert is None else min(max_tokens_per_expert, cap),
+            max_tokens_per_expert=(
+                cap
+                if max_tokens_per_expert is None
+                else min(max_tokens_per_expert, cap)
+                if resources.config.chunk_splits > 1
+                else max_tokens_per_expert
+            ),
             activation=activation,
             layout=layout,
             combine=self.combine,
@@ -135,26 +144,31 @@ class MoEBlock:
         fit = mb.plan_fused_head(resources, dtypes, self.accumulators, l1_free)
         self.x_dram = bool(fit.ok and len(fit.planned) and fit.planned[0].lay.xdram)
         # (the tail of a call: its L1 grows with the loop's rows - host only, uncached)
-        mb.plan_fused_tail(resources)
+        mb.plan_fused_tail(resources, dtype=self.tail_dtype)
 
-    def _plan_loops(self, ask, n_acc):
+    def _plan_loops(self, ask, n_acc, fixed_k=0, fixed_b=0):
         """The (splits, loops) to run (resources' token_loops / chunk_splits 0): one call wherever the chunk plans as it
         is (the head's DRAM fallback included - nothing that fits changes); else the fewest splits (each re-reads every
         expert's weights), and of their loops whose plans fit the one with the least predicted head time (k x the head
         planner's predicted call) - a resident head before a DRAM fallback."""
         resources = self.resources
         chunk, sp = resources.config.plan_tokens, resources.topology["R"]
-        try:
+        try:  # (one call, or the caller's fixed loops / splits with the other at 1)
+            resources.set_token_loops(fixed_k, fixed_b, self.pad)
             self._plan(*ask, n_acc)
             return
         except RuntimeError as ex:
             first_error = ex
             logger.info(f"MoEBlock: chunk {chunk} in one call does not fit: {_short(ex)}")
-        for b in [b for b in range(1, 65) if chunk % (b * sp * 32) == 0]:
+        # (only the dimensions the caller left at 0 are searched)
+        bs = [fixed_b] if fixed_b else [b for b in range(1, 65) if chunk % (b * sp * 32) == 0]
+        for b in bs:
             # (each chip's loop rows a whole number of tiles: x is sliced by rows)
-            ks = [k for k in range(1 if b > 1 else 2, 65) if chunk % (b * k * sp * 32) == 0]
+            ks = [fixed_k] if fixed_k else [k for k in range(1, 65) if chunk % (b * k * sp * 32) == 0]
             fits = []  # (DRAM fallback, predicted head us of the split, k)
             for k in ks:
+                if (k, b) == (fixed_k or 1, fixed_b or 1):
+                    continue  # (the one tried above)
                 resources.set_token_loops(k, b, self.pad)
                 try:
                     self._plan(*ask, n_acc)
@@ -218,20 +232,10 @@ class MoEBlock:
         assert (
             actual_start <= actual_end <= actual_start + chunk
         ), f"MoEBlock: chunk [{actual_start}, {actual_end}) holds more than {chunk} tokens or is reversed"
-        word = lambda v: torch.tensor([[[[v]]]], dtype=torch.int64)  # noqa: E731
         if self.chunk_words is None:
-            self.chunk_words = tuple(
-                ttnn.from_torch(
-                    word(v),
-                    dtype=ttnn.uint32,
-                    layout=ttnn.ROW_MAJOR_LAYOUT,
-                    device=self.mesh_device,
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
-                )
-                for v in (actual_start, actual_end)
-            )
+            self.chunk_words = self._words(actual_start, actual_end)
         else:
+            word = lambda v: torch.tensor([[[[v]]]], dtype=torch.int64)  # noqa: E731
             for v, t in zip((actual_start, actual_end), self.chunk_words):
                 ttnn.copy_host_to_device_tensor(
                     ttnn.from_torch(word(v), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT), t
