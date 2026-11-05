@@ -44,13 +44,10 @@ void bind_repeat_interleave(nb::module_& mod) {
                * - BFLOAT8_B, BFLOAT4_B
                  - TILE
 
-            Repeating the last dimension of a ``BFLOAT8_B`` or ``BFLOAT4_B`` input regroups its shared-exponent
-            blocks, so values can change.
-
         Memory Support:
             - Interleaved: DRAM and L1
-            - Sharded, with ``repeats`` > 1: a ROW_MAJOR rank-4 input that is HEIGHT_SHARDED, WIDTH_SHARDED, BLOCK_SHARDED or ND sharded in L1 stays sharded, except that repeating the last dimension of a WIDTH_SHARDED or BLOCK_SHARDED input gives an L1 interleaved output. HEIGHT_SHARDED and BLOCK_SHARDED inputs on this path need a device opened with a non-zero ``l1_small_size``. Repeating the last dimension of an ND sharded input whose shards split both of the last two dimensions currently returns wrong values.
-            - Any other sharded input is first converted to DRAM interleaved, which gives a DRAM interleaved output
+            - Sharded, with ``repeats`` > 1: a ROW_MAJOR rank-4 input that is HEIGHT_SHARDED, WIDTH_SHARDED or BLOCK_SHARDED in L1 stays sharded, except that repeating the last dimension of a WIDTH_SHARDED or BLOCK_SHARDED input gives an L1 interleaved output. HEIGHT_SHARDED and BLOCK_SHARDED inputs on this path need a device opened with a non-zero ``l1_small_size``.
+            - TILE sharded inputs, DRAM-sharded inputs and sharded inputs of rank other than 4 are first converted to DRAM interleaved, which gives a DRAM interleaved output
     )doc";
 
     ttnn::bind_function<"repeat_interleave">(
