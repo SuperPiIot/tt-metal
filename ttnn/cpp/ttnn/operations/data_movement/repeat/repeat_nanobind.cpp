@@ -26,7 +26,7 @@ void bind_repeat(nb::module_& mod) {
             repeat_dims (List[int]): the number of repetitions for each dimension. A list shorter than the tensor's rank is padded with 1s at the front, and a longer list adds leading dimensions to the output.
 
         Keyword Args:
-            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`: an interleaved input keeps its memory configuration, and a sharded input keeps its memory layout and buffer type with a shard spec derived for the output shape.
+            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`: an interleaved input keeps its memory configuration. A sharded input keeps its memory layout and buffer type, with a shard spec derived for the output shape, when such a spec can be derived; otherwise, and for an empty output, the output is interleaved in the input's buffer type. When ``optional_output_tensor`` is given, the output uses its memory configuration.
             optional_output_tensor (ttnn.Tensor, optional): Preallocated output tensor, with the output's shape, dtype and layout. Defaults to `None`.
 
         Returns:
