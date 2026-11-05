@@ -27,7 +27,7 @@ void bind_non_zero(nb::module_& mod) {
             memory_config (ttnn.MemoryConfig, optional): Memory configuration of the output tensors. It must be interleaved. Defaults to `None`, which uses DRAM.
 
         Returns:
-            List[ttnn.Tensor]: two UINT32 ROW_MAJOR tensors. The first, of shape ``[1, 1, 1, 8]``, holds the number of non-zero elements N at index ``[0, 0, 0, 0]``. The second, of shape ``[1, 1, 1, 4 * volume]``, starts with the ``(n, c, h, w)`` index of each non-zero element in row-major order, so ``indices[0, 0, 0, :4 * N].reshape(N, 4)`` matches ``torch.nonzero``. The values after those, and the other seven values of the first tensor, are not initialized.
+            List[ttnn.Tensor]: two UINT32 ROW_MAJOR tensors. The first, of shape ``[1, 1, 1, 8]``, holds the number of non-zero elements N at index ``[0, 0, 0, 0]``. The second, of shape ``[1, 1, 1, 4 * volume]``, starts with the ``(n, c, h, w)`` index of each non-zero element in row-major order, so ``indices[0, 0, 0, :4 * N].reshape(N, 4)`` holds one ``(n, c, h, w)`` index per row. The values after those, and the other seven values of the first tensor, are not initialized.
 
         Note:
             Supported dtypes and layouts:
