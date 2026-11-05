@@ -18,18 +18,39 @@ namespace ttnn::operations::data_movement::detail {
 
 void bind_repeat_interleave(nb::module_& mod) {
     const auto* doc = R"doc(
-        Repeats elements of a :attr:`tensor` in the given :attr:`dim`.
+        Repeats each element of `input_tensor` `repeats` times along dimension `dim`.
 
         Args:
             input_tensor (ttnn.Tensor): the input tensor.
-            repeats (number): he number of repetitions for each element. repeats is broadcasted to fit the shape of the given axis.
-            dim (number): the dimension to expand with the repetitions.
+            repeats (int): the number of times to repeat each element. Must be at least 1.
+            dim (int): the dimension along which to repeat. Negative values count from the last dimension.
 
-        Keyword args:
-            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`.
+        Keyword Args:
+            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`: an interleaved input keeps its memory configuration. For sharded inputs, see Memory Support.
 
         Returns:
-            ttnn.Tensor: the output tensor.
+            ttnn.Tensor: the output tensor, with the same dtype and layout as the input.
+
+        Note:
+            Supported dtypes and layouts:
+
+            .. list-table::
+               :header-rows: 1
+
+               * - Dtypes
+                 - Layouts
+               * - BFLOAT16, FLOAT32, INT32, UINT32, UINT16, UINT8
+                 - TILE, ROW_MAJOR
+               * - BFLOAT8_B, BFLOAT4_B
+                 - TILE
+
+            Repeating the last dimension of a ``BFLOAT8_B`` or ``BFLOAT4_B`` input regroups its shared-exponent
+            blocks, so values can change.
+
+        Memory Support:
+            - Interleaved: DRAM and L1
+            - Sharded, with ``repeats`` > 1: a ROW_MAJOR rank-4 input that is HEIGHT_SHARDED, WIDTH_SHARDED, BLOCK_SHARDED or ND sharded in L1 stays sharded, except that repeating the last dimension of a WIDTH_SHARDED or BLOCK_SHARDED input gives an L1 interleaved output. HEIGHT_SHARDED and BLOCK_SHARDED inputs on this path need a device opened with a non-zero ``l1_small_size``. Repeating the last dimension of an ND sharded input whose shards split both of the last two dimensions currently returns wrong values.
+            - Any other sharded input is first converted to DRAM interleaved, which gives a DRAM interleaved output
     )doc";
 
     ttnn::bind_function<"repeat_interleave">(
