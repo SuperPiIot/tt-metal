@@ -286,9 +286,9 @@ UNTRACED_PERF_MARGIN = 0.05
 
 GLM_TRACED_BASELINE_CHUNK_TIMES_S = (
     {
-        # C++ MoE block (ttnn.experimental.moe_block), gate/up weights read by the gate/up cores, main 573f4b35e8
-        # merged: CI run 41746309144 / job 126306365928 (bh_sc1_high_power).
-        (78, 11, 10): [0.270, 0.267, 0.275, 0.272, 0.277, 0.277, 0.275, 0.276, 0.283, 0.285, 0.290],
+        # C++ MoE block (ttnn.experimental.moe_block), router on the matmul cores, main 860b4917979 merged:
+        # CI run 41926693153 / job 126931997069 (bh_sc1_high_power).
+        (78, 11, 10): [0.263, 0.260, 0.267, 0.266, 0.270, 0.271, 0.268, 0.271, 0.276, 0.280, 0.284],
     }
     if GLM_MOE_BLOCK
     else {
