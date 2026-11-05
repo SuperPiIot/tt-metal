@@ -10,6 +10,13 @@ import torch
 import ttnn
 
 from tests.ttnn.utils_for_testing import assert_with_pcc, assert_equal
+from tests.ttnn.unit_tests.operations.data_movement.docstring_support import (
+    assert_exact,
+    docstring_dtype_layout_params,
+    docstring_interleaved_buffer_type_params,
+    interleaved_memory_config,
+    torch_input,
+)
 
 layouts = [ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT]
 
@@ -259,3 +266,19 @@ def test_pc_with_different_shapes_in_sequence(device):
         for i in range(64):
             z_torch = ttnn.to_torch(z_tt[i : i + 1])
             assert torch.allclose(z_torch, y, atol=1e-2), f"z_torch[{i}] != y"
+
+
+@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.repeat))
+@pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.repeat))
+def test_repeat_docstring_supported_inputs(dtype, layout, buffer_type, device):
+    """Runs every dtype, layout and interleaved buffer type the ttnn.repeat docstring lists."""
+    memory_config = interleaved_memory_config(buffer_type)
+    input_tensor = ttnn.from_torch(
+        torch_input((1, 1, 32, 32), dtype), dtype=dtype, layout=layout, device=device, memory_config=memory_config
+    )
+    output = ttnn.repeat(input_tensor, [1, 2, 1, 2], memory_config=memory_config)
+
+    assert output.dtype == dtype
+    assert output.layout == layout
+    assert output.memory_config().buffer_type == buffer_type
+    assert_exact(ttnn.to_torch(input_tensor).repeat(1, 2, 1, 2), ttnn.to_torch(output))
