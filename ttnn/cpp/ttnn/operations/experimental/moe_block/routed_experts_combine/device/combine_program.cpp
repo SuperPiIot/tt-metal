@@ -166,17 +166,45 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
             }
         }
     }
-    const auto au = combine_auto(
-        N,
-        in.S,
-        in.W,
-        pool.size(),
-        n_ports,
-        in.arena_bytes,
-        in.depth,
-        in.n_acc.value_or(kAccMax),
-        in.mode,
-        in.landing.value_or(CombineLanding::Rings));
+    // (FlatCores: the flat cells' free arena tails, whole slots a cell)
+    const uint32_t pool_off = align64(in.flat_bytes);
+    const uint32_t pool_spc = in.arena_bytes > pool_off ? (in.arena_bytes - pool_off) / plan->pc.slot : 0u;
+    const uint32_t pool_slots = pool_spc * static_cast<uint32_t>(in.flat_cells.size());
+    auto plan_with = [&](CombineLanding l) {
+        return combine_auto(
+            N,
+            in.S,
+            in.W,
+            pool.size(),
+            n_ports,
+            in.arena_bytes,
+            in.depth,
+            in.n_acc.value_or(kAccMax),
+            in.mode,
+            l,
+            pool_slots);
+    };
+    // no landing given: the rings in the accumulators' L1 or on the flat cells, whichever plans deeper rings (then the
+    // larger injection ring, then the larger local ring). 2x4 GLM-5.3-Flash experts + combine: chunk 5120 D 1 QP 8 ->
+    // D 8 QP 16 on the flat cells 2762 -> 1543 us, 1280 D 8 QL 3 -> D 8 QL 16 513 -> 489, 2560 702 -> 708
+    CombineLanding landing = in.landing.value_or(CombineLanding::Rings);
+    auto au = plan_with(landing);
+    if (!in.landing && pool_slots > 0) {
+        auto fc = plan_with(CombineLanding::FlatCores);
+        auto key = [](const CombineAuto& x) {
+            return std::make_tuple(x.best->layout.D, x.best->layout.QP, x.best->layout.QL);
+        };
+        if (fc.fits && (!au.fits || key(fc) > key(au))) {
+            au = std::move(fc);
+            landing = CombineLanding::FlatCores;
+        }
+    }
+    const bool flat_pool = landing == CombineLanding::FlatCores;
+    TT_FATAL(
+        !flat_pool || pool_slots > 0,
+        "routed_experts_combine: FlatCores landing - no free slot on the flat cells ({} KB of {} KB)",
+        in.flat_bytes >> 10,
+        in.arena_bytes >> 10);
     TT_FATAL(
         au.fits,
         "routed_experts_combine: does not fit ({} cells, {} KB): {}",
@@ -271,11 +299,13 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     // the layout (the arena budget's sizing, as sparse_combine_rf_prepare)
     plan->st = state_layout(N, A, plan->shared ? kGrants : 0);
     const uint32_t SLOT = plan->pc.slot, ISLOT = SLOT;
-    const uint32_t acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT);
+    plan->row_depth = flat_pool ? kPoolRows : 2u;
+    const uint32_t acc_cbs = acc_cb_bytes(in.S, A, plan->pc.NT, plan->row_depth);
     const uint32_t QP0 = au.best->inj_slots, keep_slots = au.best->local_keep;
     const int64_t keep = plan->fused ? static_cast<int64_t>(keep_slots + std::min(32u, QP0)) * ISLOT
                                      : static_cast<int64_t>(keep_slots) * ISLOT;
-    const int64_t fit = (static_cast<int64_t>(in.arena_bytes) - plan->st.RINGS - acc_cbs - keep) / SLOT;
+    const int64_t fit = flat_pool ? static_cast<int64_t>(pool_slots / A)
+                                  : (static_cast<int64_t>(in.arena_bytes) - plan->st.RINGS - acc_cbs - keep) / SLOT;
     const int64_t PSL = std::min<int64_t>(
         {static_cast<int64_t>(in.depth) * (N - 1),
          fit,
@@ -286,7 +316,16 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     plan->PSL = static_cast<uint32_t>(PSL);
     plan->D = N > 1 ? plan->PSL / (N - 1) : 0;
     plan->cred = credit_policy(N, plan->D, plan->shared, in.credit_batch);
-    const uint32_t acc_area = plan->st.RINGS + plan->PSL * SLOT;
+    const uint32_t acc_area = plan->st.RINGS + (flat_pool ? 0u : plan->PSL * SLOT);
+    if (flat_pool) {  // (every flat cell, in the flat plan's order)
+        plan->flat_pool = true;
+        plan->pool_off = pool_off;
+        plan->pool_spc = pool_spc;
+        for (uint32_t i = 0; i < in.flat_cells.size(); ++i) {
+            const auto v = mesh_device.worker_core_from_logical_core(in.flat_cells.at(i));
+            plan->pool_xy.push_back(static_cast<uint32_t>(v.x) | static_cast<uint32_t>(v.y) << 8);
+        }
+    }
     uint32_t QP = QP0, QL = 0;
     if (plan->fused) {  // (local ring up to 16 slots, then the injection ring up to QP, from what is left)
         const int64_t a_end = align64(acc_area) + acc_cbs;
@@ -316,11 +355,11 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     };
     const uint32_t NT = plan->pc.NT;
     plan->tab_off_acc = take(kTabCbBytes);
-    plan->row_off = take(2 * NT * kTile);
-    plan->meta_off = take(2 * 32);
+    plan->row_off = take(plan->row_depth * NT * kTile);
+    plan->meta_off = take(plan->row_depth * 32);
     plan->acc_off = take(plan->MAXT * NT * 4096);
     plan->out_off = take(2 * NT * kTile);
-    plan->w_off = take(2 * kTile);
+    plan->w_off = take(plan->row_depth * kTile);
     plan->loc_off = e;
     TT_FATAL(
         std::max(e, plan->fused ? 0u : plan->tab_off_port + kTabCbBytes) <= in.arena_bytes,
@@ -438,11 +477,11 @@ CombineHandles add_combine_program(
         arena_cb(kCbTab, cores_of(only_ports), plan.tab_off_port, kTabCbBytes, tt::DataFormat::UInt32, kTabCbBytes);
     }
     arena_cb(kCbTab, aset, plan.tab_off_acc, kTabCbBytes, tt::DataFormat::UInt32, kTabCbBytes);
-    arena_cb(kCbRow, aset, plan.row_off, 2 * NT * kTile, tt::DataFormat::Float16_b, kTile);
-    arena_cb(kCbMeta, aset, plan.meta_off, 2 * 32, tt::DataFormat::UInt32, 32);
+    arena_cb(kCbRow, aset, plan.row_off, plan.row_depth * NT * kTile, tt::DataFormat::Float16_b, kTile);
+    arena_cb(kCbMeta, aset, plan.meta_off, plan.row_depth * 32, tt::DataFormat::UInt32, 32);
     arena_cb(kCbAcc, aset, plan.acc_off, plan.MAXT * NT * 4096, tt::DataFormat::Float32, 4096);
     arena_cb(kCbOut, aset, plan.out_off, 2 * NT * kTile, tt::DataFormat::Float16_b, kTile);
-    arena_cb(kCbW, aset, plan.w_off, 2 * kTile, tt::DataFormat::Float16_b, kTile);
+    arena_cb(kCbW, aset, plan.w_off, plan.row_depth * kTile, tt::DataFormat::Float16_b, kTile);
 
     // the zero gate: accumulator 0 releases every combine core once the zeroing kernels counted in (ports' senders
     // unless they share an accumulator's core, the accumulators' readers, the flat expert's y writers)
@@ -541,6 +580,14 @@ CombineHandles add_combine_program(
             defs["REC_GIDH"] = std::to_string(st.GIDH);
             defs["REC_GREC"] = std::to_string(st.GREC);
         }
+        auto pool_defs = [&](std::map<std::string, std::string>& d) {  // (FlatCores: the rings on the flat cells)
+            if (plan.flat_pool) {
+                d["REC_POOL"] = "1";
+                d["REC_POOL_OFF"] = std::to_string(plan.pool_off);
+                d["REC_POOL_SPC"] = std::to_string(plan.pool_spc);
+            }
+        };
+        pool_defs(defs);
         accessor(ct, defs, "CMB_PLAN_CT", CombineBuf::Plan);
         accessor(ct, defs, "CMB_HC_CT", CombineBuf::Hcache);
         if (plan.perchip) {
@@ -568,6 +615,10 @@ CombineHandles add_combine_program(
                 a.buf(CombineBuf::Lut);
             } else {
                 a.lits(acc_xy);
+            }
+            if (plan.flat_pool) {
+                a.lit(static_cast<uint32_t>(plan.pool_xy.size()));
+                a.lits(plan.pool_xy);
             }
             for (uint32_t i = 0; i < N; ++i) {  // per source chip: the port on it that feeds me on my link
                 const auto s = topo.coord(i);
@@ -652,6 +703,12 @@ CombineHandles add_combine_program(
             rd_defs["REC_G"] = std::to_string(st.G);
             rd_defs["REC_GIDH"] = std::to_string(st.GIDH);
         }
+        if (plan.flat_pool) {
+            rd_defs["REC_POOL"] = "1";
+            rd_defs["REC_POOL_OFF"] = std::to_string(plan.pool_off);
+            rd_defs["REC_POOL_SPC"] = std::to_string(plan.pool_spc);
+            rd_defs["REC_POOL_ROWS"] = std::to_string(plan.row_depth);
+        }
         accessor(rd_ct, rd_defs, "CMB_PLAN_CT", CombineBuf::Plan);
         const auto rd =
             dm_kernel(program, "dataflow/accumulator_reader.cpp", aset, std::move(rd_ct), r_riscv0, std::move(rd_defs));
@@ -696,6 +753,10 @@ CombineHandles add_combine_program(
                 } else {
                     a.lits({0u, 0u});
                 }
+            }
+            if (plan.flat_pool) {
+                a.lit(static_cast<uint32_t>(plan.pool_xy.size()));
+                a.lits(plan.pool_xy);
             }
             a.lits({i == 0 ? 1u : 0u, nz, i == 0 ? static_cast<uint32_t>(comb.size()) : 0u});  // (the gate)
             if (i == 0) {

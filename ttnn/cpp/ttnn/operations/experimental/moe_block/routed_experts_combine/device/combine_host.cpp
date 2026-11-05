@@ -45,10 +45,10 @@ StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G) {
     return s;
 }
 
-uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT) {
+uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows) {
     const uint32_t MAXT = (S + A - 1) / A;
-    return align64(kTabCbBytes) + align64(2 * NT * kTile) + align64(2 * 32) + align64(MAXT * NT * 4096) +
-           align64(2 * NT * kTile) + align64(2 * kTile);
+    return align64(kTabCbBytes) + align64(rows * NT * kTile) + align64(rows * 32) + align64(MAXT * NT * 4096) +
+           align64(2 * NT * kTile) + align64(rows * kTile);
 }
 
 CombineLayout combine_l1_layout(
@@ -61,7 +61,8 @@ CombineLayout combine_l1_layout(
     uint32_t inj_slots,
     uint32_t depth,
     uint32_t local_keep,
-    bool shared) {
+    bool shared,
+    uint32_t pool_slots) {
     const auto pc = row_slot(W);
     const int64_t ISLOT = pc.slot, SLOT = pc.slot;
     const int64_t RINGS = state_layout(N, A, shared ? kGrants : 0).RINGS;
@@ -69,7 +70,7 @@ CombineLayout combine_l1_layout(
     CombineLayout out;
     out.slot = pc.slot;
     out.acc_fp32 = MAXT * pc.NT * 4096;
-    out.acc_cbs = acc_cb_bytes(S, A, pc.NT);
+    out.acc_cbs = acc_cb_bytes(S, A, pc.NT, pool_slots > 0 ? kPoolRows : 2);
     out.rings = static_cast<uint32_t>(RINGS);
     const int64_t arena = arena_bytes, acc_cbs = out.acc_cbs;
     auto fail = [&](std::string why) {
@@ -81,9 +82,14 @@ CombineLayout combine_l1_layout(
     const int64_t keep = acc_on_ports ? (local_keep + std::min<int64_t>(32, QP)) * ISLOT : local_keep * ISLOT;
     // (Python floor division: a negative budget floors toward -inf)
     auto fdiv = [](int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
-    const int64_t fit = fdiv(arena - RINGS - acc_cbs - keep, SLOT);
+    // (the landing pool on the flat cores: each accumulator's share of their slots, nothing in its own L1)
+    const bool flat_pool = pool_slots > 0;
+    const int64_t fit = flat_pool ? static_cast<int64_t>(pool_slots / A) : fdiv(arena - RINGS - acc_cbs - keep, SLOT);
     if (shared && acc_on_ports) {
         return fail("shared landing: the accumulators apart from the ports only");
+    }
+    if (shared && flat_pool) {
+        return fail("shared landing: in the accumulators' L1 only");
     }
     const int64_t PSL = std::min<int64_t>(
         {static_cast<int64_t>(depth) * (N - 1), fit, shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
@@ -96,7 +102,7 @@ CombineLayout combine_l1_layout(
     if (PSL >= 4096) {
         return fail("landing pool >= 4096 slots (12-bit ring fields)");
     }
-    const int64_t acc_area = RINGS + PSL * SLOT;
+    const int64_t acc_area = RINGS + (flat_pool ? 0 : PSL * SLOT);
     const int64_t a_end = align64(acc_area) + acc_cbs;
     int64_t QL = 0, acc_used = 0, port_used = 0;
     if (acc_on_ports) {
@@ -136,8 +142,12 @@ CombineAuto combine_auto(
     uint32_t depth,
     uint32_t a_max,
     std::optional<CombineMode> mode,
-    CombineLanding landing) {
+    CombineLanding landing,
+    uint32_t pool_slots) {
     const bool shared = landing == CombineLanding::Shared;
+    if (landing != CombineLanding::FlatCores) {
+        pool_slots = 0;
+    }
     CombineAuto res;
     std::vector<std::string> why;
     auto score = [](const CombineAutoChoice& c) {
@@ -163,7 +173,8 @@ CombineAuto combine_auto(
         for (const uint32_t keep : {8u, 2u}) {
             for (const uint32_t qp : {64u, 32u, 16u, 8u}) {
                 auto lay =
-                    combine_l1_layout(N, S, W, static_cast<uint32_t>(A), arena_bytes, fused, qp, depth, keep, shared);
+                    combine_l1_layout(
+                    N, S, W, static_cast<uint32_t>(A), arena_bytes, fused, qp, depth, keep, shared, pool_slots);
                 if (!lay.fits) {
                     last = lay;
                     continue;

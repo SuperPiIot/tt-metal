@@ -67,6 +67,14 @@ constexpr uint32_t SHARED = 0, G = 1, GIDH = 0, GREC = 0;
 #endif
 constexpr uint32_t SNAPW = SHARED ? AP * (1 + G) : AP;  // (a snapshot's words)
 #define GTAG(q) (0x80u | ((q) & 0x7Fu))                // (a grant's tag: never 0 - a zeroed entry is no grant)
+// REC_POOL (CombineLanding::FlatCores): a home's accumulator o's ring slot i is on the flat cells - pool slot
+// g = o x PSL + i, at the pool cell g / SPC (runtime args: count, then x | y << 8 each; the same cells on every chip),
+// arena offset POOL_OFF + (g % SPC) x SLOT
+#ifdef REC_POOL
+constexpr uint32_t POOL = 1, POOL_OFF = REC_POOL_OFF, SPC = REC_POOL_SPC;
+#else
+constexpr uint32_t POOL = 0, POOL_OFF = 0, SPC = 1;
+#endif
 #ifdef REC_FUSED
 constexpr uint32_t cb_out = get_compile_time_arg_val(29);
 constexpr uint32_t NT_ = get_compile_time_arg_val(30);
@@ -119,6 +127,10 @@ void kernel_main() {
 #define ACC_X(h, o) ax[o]
 #define ACC_Y(h, o) ay[o]
 #endif
+    const uint32_t pool_a = a + 1;
+    if constexpr (POOL) {
+        a += 1 + get_arg_val<uint32_t>(a);
+    }
     // per source chip s: the port on s that feeds my chip on my link (where s's credits go); 0 if not mine to return
     uint32_t sx[N], sy[N];
     for (uint32_t i = 0; i < N; ++i) {
@@ -277,12 +289,18 @@ void kernel_main() {
     }
     volatile tt_l1_ptr uint32_t* gidh = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(area + GIDH);
     volatile tt_l1_ptr uint32_t* grec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(area + GREC);
-    uint32_t inj_done = 0, sent = 0, pend_inj = 0, unflushed = 0;
+    uint32_t inj_done = 0, sent = 0, unflushed = 0;
+    // skip-ahead: rows of the injection ring go out in any order (a row waits only for its own ring's room or grant,
+    // not for the rows ahead of it); bit j: the row j pages past the ring's front is sent. The ring frees its front
+    // pages once they are sent and flushed (their slots are written again by the hand-off)
+    constexpr uint32_t WIN = 32;
+    uint32_t sentm = 0;
 
     auto flush = [&]() {
         noc_async_writes_flushed();
-        for (; pend_inj; --pend_inj) {
+        while (sentm & 1u) {
             cb_pop_front(cb_inj, 1);
+            sentm >>= 1;
         }
         unflushed = 0;
     };
@@ -422,11 +440,18 @@ void kernel_main() {
             if (dep + cred[ci] - u < 1) {
                 return false;
             }
-            dst = area + RINGS + (((lw >> 12) & 0xFFF) + (u - u0[ci]) % dep) * SLOT;  // (my ring)
+            dst = ((lw >> 12) & 0xFFF) + (u - u0[ci]) % dep;  // (my ring's slot)
+        }
+        uint64_t dn;
+        if constexpr (POOL) {
+            const uint32_t g = o * PSL + dst, xy = get_arg_val<uint32_t>(pool_a + g / SPC);
+            dn = get_noc_addr(xy & 0xFF, xy >> 8, area + POOL_OFF + (g % SPC) * SLOT);
+        } else {
+            dn = get_noc_addr(ACC_X(home, o), ACC_Y(home, o), SHARED ? dst : area + RINGS + dst * SLOT);
         }
         constexpr uint32_t pb = row_bytes + 32;
         auto* h = hdr_at(home, sent % NH);
-        h->to_noc_unicast_write(NocUnicastCommandHeader{get_noc_addr(ACC_X(home, o), ACC_Y(home, o), dst)}, pb);
+        h->to_noc_unicast_write(NocUnicastCommandHeader{dn}, pb);
         conn.wait_for_empty_write_slot();
         conn.send_current_slot_non_blocking(src, pb, reinterpret_cast<uint32_t>(h));
         ++sent;
@@ -448,18 +473,23 @@ void kernel_main() {
         if (lay_pend) {
             send_layouts();
         }
-        while (unflushed < NH && inj_done < n_inj && cb_pages_available_at_front(cb_inj, pend_inj + 1)) {
-            uint32_t src = get_read_ptr(cb_inj) + pend_inj * ISLOT;
+        for (uint32_t j = 0; j < WIN && unflushed < NH && inj_done < n_inj; ++j) {
+            if (sentm >> j & 1u) {
+                continue;
+            }
+            if (!cb_pages_available_at_front(cb_inj, j + 1)) {
+                break;
+            }
+            uint32_t src = get_read_ptr(cb_inj) + j * ISLOT;
             const uint32_t ilim = get_local_cb_interface(cb_inj).fifo_limit;
             if (src >= ilim) {
                 src -= get_local_cb_interface(cb_inj).fifo_size;
             }
-            if (!send_row(src)) {
-                break;  // (its ring's layout not here yet, or the ring full)
+            if (send_row(src)) {  // (else its ring's layout not here yet, or the ring full: the next rows may go)
+                sentm |= 1u << j;
+                ++inj_done;
+                did = true;
             }
-            ++pend_inj;
-            ++inj_done;
-            did = true;
         }
         if (unflushed >= NH || (!did && unflushed)) {
             flush();

@@ -65,7 +65,10 @@ struct StateLayout {
 StateLayout state_layout(uint32_t N, uint32_t A, uint32_t G = 0);
 
 // _acc_cbs: an accumulator's CB bytes (CB_TAB, CB_ROW, CB_META, CB_ACC, CB_OUT, CB_W; each 64 B aligned).
-uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT);
+uint32_t acc_cb_bytes(uint32_t S, uint32_t A, uint32_t NT, uint32_t rows = 2);
+// the accumulator's row CB depth (rows, its meta and weight CBs too) with the rings on the flat cells: its row reads
+// cross the NoC, kPoolRows of them in flight
+inline constexpr uint32_t kPoolRows = 4;
 
 // combine_l1_layout: what the combine puts in each core's arena budget (bytes). Pure.
 struct CombineLayout {
@@ -94,15 +97,20 @@ CombineLayout combine_l1_layout(
     uint32_t inj_slots = 64,
     uint32_t depth = 8,
     uint32_t local_keep = 8,
-    bool shared = false);
+    bool shared = false,
+    uint32_t pool_slots = 0);
 
 enum class CombineMode : uint8_t { PortsApart = 0, AccOnPorts = 1 };
 
 // The landing pool at an accumulator: Rings - carved per call into one ring per source chip (a source's rows go to its
 // ring's next slot, credits return consumed slots); Shared - one free list, the accumulator grants specific slots to
 // the sources with rows pending (ids ride the credit snapshots, tag-validated), so a burst from one source uses slots
-// another source's ring would hold empty. Shared: accumulators apart from the ports only.
-enum class CombineLanding : uint8_t { Rings = 0, Shared = 1 };
+// another source's ring would hold empty. Shared: accumulators apart from the ports only. FlatCores - rings as Rings,
+// their slots in the flat expert cores' free L1 (each flat core's arena past the flat plan's bytes) instead of the
+// accumulator's: the accumulator keeps only its fp32 sums and CBs there, it learns a row landed by reading the slot's
+// trailer and takes the row with a NoC read (as it takes a local slot's), so deep rings cost the accumulators nothing.
+// (pool_slots: the flat cores' slots a chip, every accumulator's rings carved from them; 0 - in the accumulators' L1)
+enum class CombineLanding : uint8_t { Rings = 0, Shared = 1, FlatCores = 2 };
 
 // combine_auto: the combine's configuration from the cells the flat plan leaves (n_cells, port_cells of them the
 // ports') and the arena budget. mode: that mode only.
@@ -132,7 +140,8 @@ CombineAuto combine_auto(
     uint32_t depth = 8,
     uint32_t a_max = kAccMax,
     std::optional<CombineMode> mode = std::nullopt,
-    CombineLanding landing = CombineLanding::Rings);
+    CombineLanding landing = CombineLanding::Rings,
+    uint32_t pool_slots = 0);
 
 // The credit policy: a port returns a source's credits once it consumed CRED_THR of its rows; its idle credit
 // snapshots are batched (CRED_IDLE rows, or CRED_AGE cycles old). N chips, D landing slots a source chip (average);

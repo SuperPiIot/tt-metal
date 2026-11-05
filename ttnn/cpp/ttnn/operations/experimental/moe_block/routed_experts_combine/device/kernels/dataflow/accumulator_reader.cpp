@@ -45,6 +45,16 @@ static_assert(PSL <= 254, "shared landing: slot owners are bytes (0xFF: free)");
 constexpr uint32_t SHARED = 0, G = 1, GIDH = 0;
 #endif
 #define GTAG(q) (0x80u | ((q) & 0x7Fu))  // (a grant's tag: never 0 - a zeroed ring entry is no grant)
+// REC_POOL (CombineLanding::FlatCores): the rings' slots on the flat cells - ring slot i is pool slot g = me x PSL + i,
+// at the pool cell g / SPC (runtime args: count, then x | y << 8 each), arena offset POOL_OFF + (g % SPC) x SLOT. A
+// row landed once its trailer reads so (32 B reads, several slots a source at once); taking it clears the trailer there
+// before the credit goes back (trailers zeroed each call).
+#ifdef REC_POOL
+constexpr uint32_t POOL = 1, POOL_OFF = REC_POOL_OFF, SPC = REC_POOL_SPC, PROWS = REC_POOL_ROWS;
+static_assert(!SHARED, "the shared landing: in the accumulators' L1 only");
+#else
+constexpr uint32_t POOL = 0, POOL_OFF = 0, SPC = 1, PROWS = 2;
+#endif
 
 void kernel_main() {
     size_t a = 0;
@@ -58,12 +68,28 @@ void kernel_main() {
     // are set)
     const uint32_t call = rec::next_call(bar, BAR_SLOT);
     rec::zero_l1(area, RINGS);
-    rec::zero_l1_strided(area + RINGS + LASTPB, 32, SLOT, PSL);
+    const uint32_t pool_a = 7 + 2 * N + 1;  // (REC_POOL: the pool cells' args, after the ports' x, y and their count)
+    auto pool_noc = [&](uint32_t i) -> uint64_t {  // my ring slot i's NoC address on its flat cell
+        const uint32_t g = me * PSL + i;
+        const uint32_t xy = get_arg_val<uint32_t>(pool_a + g / SPC);
+        return get_noc_addr(xy & 0xFF, xy >> 8, area + POOL_OFF + (g % SPC) * SLOT);
+    };
+    if constexpr (POOL) {  // (no row in any of my slots: their trailers zeroed, from the zeroed state's first words)
+        for (uint32_t i = 0; i < PSL; ++i) {
+            noc_async_write(area, pool_noc(i) + LASTPB, 32);
+        }
+        noc_async_write_barrier();
+    } else {
+        rec::zero_l1_strided(area + RINGS + LASTPB, 32, SLOT, PSL);
+    }
     rec::count_in(gate_x, gate_y, bar);
     uint32_t want[N], px[N], py[N];
     for (uint32_t k = 0; k < N; ++k) {
         px[k] = get_arg_val<uint32_t>(a++);
         py[k] = get_arg_val<uint32_t>(a++);
+    }
+    if constexpr (POOL) {
+        a += 1 + get_arg_val<uint32_t>(a);
     }
     {
         const uint32_t is_gate = get_arg_val<uint32_t>(a++), nz = get_arg_val<uint32_t>(a++);
@@ -166,6 +192,13 @@ void kernel_main() {
     // a source's granted slots in grant order - it fills them in that order (one port, one path), so its oldest
     // outstanding grant, at (issued - outstanding) % G, is the only one to check
     volatile tt_l1_ptr uint16_t* gq = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 1024);
+    const uint32_t probe = sc + 1024;  // (REC_POOL, rings only: each source's next slots' trailers, 32 B a slot)
+    const uint32_t zero32 = sc + 2048;  // (REC_POOL: 32 B of zeros - a taken slot's trailer)
+    if constexpr (POOL) {
+        for (uint32_t w = 0; w < 8; ++w) {
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zero32)[w] = 0;
+        }
+    }
     uint32_t gout[N], giss[N], nfree = 0;
     auto grant = [&](uint32_t k, uint32_t slot) {  // (the id into the home port's grant ring, then its count)
         const uint32_t seq = t0[k] + giss[k];
@@ -288,6 +321,44 @@ void kernel_main() {
         noc_semaphore_inc(get_noc_addr(px[k], py[k], area + MISC + 4 * (MRTOT + k)), 1);
         return true;
     };
+    // REC_POOL: the landed rows of the probed slots, PROWS row reads in flight (the row CB's depth); taking a row clears
+    // its trailer there (the caller fences those writes before the credits go back)
+    constexpr uint32_t PP = N > 16 ? 1 : (N > 8 ? 2 : 4);  // (slots probed a source: N x PP x 32 B of CB_TAB)
+    uint32_t inflight = 0;
+    auto flush_rows = [&]() {
+        noc_async_read_barrier();
+        for (uint32_t i = 0; i < inflight; ++i) {  // (a row at a time: a push wraps the CB only at its exact end)
+            cb_push_back(cb_row, NT);
+            cb_push_back(cb_meta, 1);
+        }
+        inflight = 0;
+    };
+    auto take_pool = [&](uint32_t k, volatile tt_l1_ptr uint32_t* tr) {
+        const uint32_t tk = taken[k];
+        const uint64_t sn = pool_noc(rbase[k] + (tk - t0[k]) % rdep[k]);
+        cb_reserve_back(cb_w, 1);
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_w))[0] = tr[1] & 0xFFFF;
+        cb_push_back(cb_w, 1);
+        cb_reserve_back(cb_row, NT * (inflight + 1));
+        cb_reserve_back(cb_meta, inflight + 1);
+        uint32_t rp = get_write_ptr(cb_row) + inflight * NT * get_local_cb_interface(cb_row).fifo_page_size;
+        if (rp >= get_local_cb_interface(cb_row).fifo_limit) {
+            rp -= get_local_cb_interface(cb_row).fifo_size;
+        }
+        uint32_t mp = get_write_ptr(cb_meta) + inflight * get_local_cb_interface(cb_meta).fifo_page_size;
+        if (mp >= get_local_cb_interface(cb_meta).fifo_limit) {
+            mp -= get_local_cb_interface(cb_meta).fifo_size;
+        }
+        noc_async_read(sn, rp, row_bytes);
+        noc_async_write(zero32, sn + LASTPB, 32);
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(mp)[0] = ((tr[0] >> 8) & 0xFFFF) / A;
+        taken[k] = tk + 1;
+        --want[k];
+        ++done;
+        if (++inflight == PROWS) {
+            flush_rows();
+        }
+    };
     auto take_slot = [&](uint32_t i) -> bool {  // shared: slot i's row, if it landed
         const uint32_t s = area + RINGS + i * SLOT;
         volatile tt_l1_ptr uint32_t* tr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(s + LASTPB);
@@ -322,6 +393,44 @@ void kernel_main() {
             }
             if (any) {
                 regrant();
+            }
+        } else if constexpr (POOL) {  // (each source's next PP slots probed at once, then the landed rows taken)
+            uint32_t np[N];
+            for (uint32_t k = 0; k < N; ++k) {
+                uint32_t n = want[k] < PP ? want[k] : PP;
+                n = n < rdep[k] ? n : rdep[k];
+                np[k] = n;
+                for (uint32_t j = 0; j < n; ++j) {
+                    noc_async_read(
+                        pool_noc(rbase[k] + (taken[k] + j - t0[k]) % rdep[k]) + LASTPB, probe + 32 * (k * PP + j), 32);
+                }
+            }
+            noc_async_read_barrier();
+            uint32_t got[N], any = 0;
+            for (uint32_t k = 0; k < N; ++k) {
+                got[k] = 0;
+                for (uint32_t j = 0; j < np[k]; ++j) {
+                    volatile tt_l1_ptr uint32_t* tr =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(probe + 32 * (k * PP + j));
+                    if (tr[3] == 0 || tr[7] == 0) {
+                        break;
+                    }
+                    take_pool(k, tr);
+                    ++got[k];
+                }
+                any |= got[k];
+            }
+            if (any) {  // (credits once the rows are read and their trailers cleared: the sources write the slots again)
+                if (inflight) {
+                    flush_rows();
+                }
+                noc_async_write_barrier();
+                for (uint32_t k = 0; k < N; ++k) {
+                    if (got[k]) {
+                        noc_semaphore_inc(get_noc_addr(px[k], py[k], area + RET + 4 * (k * AP + me)), got[k]);
+                        noc_semaphore_inc(get_noc_addr(px[k], py[k], area + MISC + 4 * (MRTOT + k)), got[k]);
+                    }
+                }
             }
         } else {
             for (uint32_t k = 0; k < N; ++k) {

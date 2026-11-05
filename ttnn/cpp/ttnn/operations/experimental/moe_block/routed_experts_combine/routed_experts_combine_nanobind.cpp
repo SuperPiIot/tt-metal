@@ -162,8 +162,10 @@ void bind_routed_experts_combine(nb::module_& mod) {
            uint32_t depth,
            uint32_t a_max,
            std::optional<CombineMode> mode,
-           CombineLanding landing) {
-            const auto r = combine_auto(N, S, W, n_cells, port_cells, arena_bytes, depth, a_max, mode, landing);
+           CombineLanding landing,
+           uint32_t pool_slots) {
+            const auto r =
+                combine_auto(N, S, W, n_cells, port_cells, arena_bytes, depth, a_max, mode, landing, pool_slots);
             nb::dict modes;
             if (r.ports_apart) {
                 modes["ports apart"] = choice_dict(*r.ports_apart);
@@ -190,7 +192,9 @@ void bind_routed_experts_combine(nb::module_& mod) {
         nb::arg("a_max") = kAccMax,
         nb::arg("mode").none() = nb::none(),
         nb::arg("landing") = CombineLanding::Rings,
-        "The combine's automatic configuration as a dict (mode: a CombineMode, or none for the best).");
+        nb::arg("pool_slots") = 0,
+        "The combine's automatic configuration as a dict (mode: a CombineMode, or none for the best; pool_slots: "
+        "CombineLanding.FlatCores' slots on the flat cells a chip).");
     mod.def(
         "combine_credit_policy",
         [](uint32_t N, uint32_t D, bool shared, std::optional<uint32_t> batch) {
@@ -225,6 +229,7 @@ void bind_routed_experts_combine(nb::module_& mod) {
             d["acc_on_ports"] = l1.plan->fused;
             d["shared"] = l1.plan->shared;
             d["PSL"] = l1.plan->PSL;
+            d["flat_pool"] = l1.plan->flat_pool;
             return d;
         },
         nb::arg("resources"),

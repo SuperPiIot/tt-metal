@@ -30,6 +30,7 @@ struct GroupKey {
     uint32_t mt = 0, hbuf = 0;              // the flat plan
     uint32_t A = 0, D = 0, QP = 0, QL = 0;  // the combine's (QL at most 8)
     bool fused = false;
+    bool flat_pool = false;                      // the combine's rings on the flat cells
     std::optional<fused_head::HeadLayout> head;  // the head's pick
     bool operator==(const GroupKey&) const = default;
 };
@@ -79,9 +80,9 @@ const MoEBlockPlan& moe_block_plan(
                 resources, max_tokens_per_expert, activation, layout, comb, g, port);
             const auto fp = flat_routed_expert::flat_routed_expert_plan(mesh, c.flat);
             const auto& cp = *c.plan;
-            const GroupKey key{fp->mt, fp->hbuf, cp.A, cp.D, cp.QP, std::min(cp.QL, 8u), cp.fused, lay};
+            const GroupKey key{fp->mt, fp->hbuf, cp.A, cp.D, cp.QP, std::min(cp.QL, 8u), cp.fused, cp.flat_pool, lay};
             out.note += fmt::format(
-                "{}group {}: static CBs {} KB, combine arena {} KB, flat {} rows x {} h buffers, A {} D {}, head {} "
+                "{}group {}: static CBs {} KB, combine arena {} KB, flat {} rows x {} h buffers, A {} D {}{}, head {} "
                 "(arena {} KB)",
                 base ? "; " : "",
                 g,
@@ -91,6 +92,7 @@ const MoEBlockPlan& moe_block_plan(
                 fp->hbuf,
                 cp.A,
                 cp.D,
+                cp.flat_pool ? " (rings on the flat cells)" : "",
                 fused_head::describe_layout(lay),
                 fit.planned[0].arena >> 10);
             if (base && !(key == *base)) {

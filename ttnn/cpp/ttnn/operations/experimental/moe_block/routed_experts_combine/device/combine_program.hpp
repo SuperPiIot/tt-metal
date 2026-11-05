@@ -64,6 +64,9 @@ struct CombinePlanInputs {
     uint32_t depth = 8;
     std::optional<CombineLanding> landing;       // nullopt: rings
     std::optional<uint32_t> credit_batch;        // nullopt: the planner's (credit_policy)
+    // CombineLanding::FlatCores: the flat expert's cells and its bytes a core (their arena past them is free)
+    std::vector<tt::tt_metal::CoreCoord> flat_cells;
+    uint32_t flat_bytes = 0;
 };
 
 // Everything the combine's program needs that depends only on the mesh, the config and the plan inputs: computed once
@@ -80,6 +83,13 @@ struct CombinePlan {
     bool fused = false;    // acc_on_ports
     bool perchip = false;  // per-chip accumulator roles (ports apart): the senders' DRAM LUT
     bool shared = false;   // the shared landing pool (CombineLanding::Shared)
+    // CombineLanding::FlatCores: accumulator o's ring slot i is pool slot g = o x PSL + i, on flat cell pool_xy[g /
+    // pool_spc] (virtual x | y << 8, the same cells on every chip: all of them), arena offset pool_off + (g % pool_spc)
+    // x slot
+    bool flat_pool = false;
+    uint32_t pool_off = 0, pool_spc = 0;
+    uint32_t row_depth = 2;  // the accumulators' row / meta / weight CBs (rows): kPoolRows with flat_pool
+    std::vector<uint32_t> pool_xy;
     CreditPolicy cred;
     CombineAutoChoice choice;
 
