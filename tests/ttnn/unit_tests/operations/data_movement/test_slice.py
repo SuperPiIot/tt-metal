@@ -8,6 +8,13 @@ import torch
 
 import ttnn
 from tests.ttnn.utils_for_testing import assert_with_pcc, assert_equal
+from tests.ttnn.unit_tests.operations.data_movement.docstring_support import (
+    assert_exact,
+    docstring_dtype_layout_params,
+    docstring_interleaved_buffer_type_params,
+    interleaved_memory_config,
+    torch_input,
+)
 from tests.ttnn.unit_tests.operations.data_movement.test_slice_write import offset_increment_tensor
 from tests.ttnn.unit_tests.operations.test_utils import round_up
 import math
@@ -2365,3 +2372,19 @@ def test_slice_nd_sharded_tensor_args_inherited_vs_explicit(device):
     explicit = ttnn.slice(tt_input, start, end, slice_dim=2, num_devices=2, memory_config=mem_config)
     assert list(explicit.memory_config().nd_shard_spec.shard_shape) == [1, 1, 64, 64]
     assert torch.equal(ttnn.to_torch(explicit), torch_expected)
+
+
+@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.slice))
+@pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.slice))
+def test_slice_docstring_supported_inputs(dtype, layout, buffer_type, device):
+    """Runs every dtype, layout and interleaved buffer type the ttnn.slice docstring lists."""
+    memory_config = interleaved_memory_config(buffer_type)
+    input_tensor = ttnn.from_torch(
+        torch_input((1, 1, 64, 64), dtype), dtype=dtype, layout=layout, device=device, memory_config=memory_config
+    )
+    output = ttnn.slice(input_tensor, [0, 0, 32, 0], [1, 1, 64, 64], memory_config=memory_config)
+
+    assert output.dtype == dtype
+    assert output.layout == layout
+    assert output.memory_config().buffer_type == buffer_type
+    assert_exact(ttnn.to_torch(input_tensor)[:, :, 32:, :], ttnn.to_torch(output))
