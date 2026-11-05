@@ -302,8 +302,10 @@ class TtK3MoEBlockFfn:
             hit = _BLOCKS[key] = (self.mesh, res, block)
         return hit[2]
 
-    def _routed(self, block):
-        """This layer's flat expert tensors (gidx, w_gu, w_d), laid out on the device from TtMoe's bfp4 cache."""
+    def _routed(self, block, sources=None):
+        """This layer's flat expert tensors (gidx, w_gu, w_d), laid out on the device from TtMoe's bfp4 cache - or from
+        sources(experts): the same plain sources (s = le * 3 + gate / up / down, [1, 1, in, out] bfp4 a chip, DRAM) made
+        some other way (_host_sources)."""
         mb, fw = ttnn.experimental.moe_block, flat_weights_module()
         R, C = tuple(self.mesh.shape)
         N, E = R * C, self.dims.num_experts
@@ -334,6 +336,8 @@ class TtK3MoEBlockFfn:
             for n in ("w_gu", "w_d")
         }
         cache = self.cache if self.cache is not None else _cache_dir(self.mesh)
+        if sources is not None:
+            cache = "host weights"  # (the log's source label; device_sources is not called)
         for n in dst:
             pages = (int(dst[n].shape[-2]) // 32) * (int(dst[n].shape[-1]) // 32)
             got = sum(int(sub[n][0].numel()) for _, _, sub in batches)
@@ -342,7 +346,11 @@ class TtK3MoEBlockFfn:
         n_srcs = 0
         for e0, e1, sub in batches:
             t1 = time.time()
-            srcs = device_sources(self.mesh, self.layer_idx, epc, cache, experts=range(e0, e1))
+            srcs = (
+                sources(range(e0, e1))
+                if sources is not None
+                else device_sources(self.mesh, self.layer_idx, epc, cache, experts=range(e0, e1))
+            )
             t2 = time.time()
             for n, (rows, fm) in sub.items():
                 gather(self.mesh, srcs, fm, dst[n], pages=rows)
@@ -365,39 +373,37 @@ class TtK3MoEBlockFfn:
         )
         return gidx, dst["w_gu"], dst["w_d"]
 
-    def _routed_host(self, block):
-        """This layer's flat expert tensors from the state dict's host routed experts (expert e on chip e // epc, in
-        the chips' row-major order: the block's global expert e is the model's expert e)."""
-        mb, fw = ttnn.experimental.moe_block, flat_weights_module()
+    def _host_sources(self, experts):
+        """The state dict's routed experts as flat_gather's plain sources (device_sources' layout): per local expert le
+        and projection, chip n's expert n * epc + le transposed to [in, out], bfp4 in DRAM - a batch of experts at a
+        time, so the host holds one projection of every chip at once (not the layer packed)."""
         R, C = tuple(self.mesh.shape)
-        N, E = R * C, self.dims.num_experts
-        epc, Hr, I = E // N, self.dims.routed_width, self.dims.routed_expert_hidden_dim
-        kw = block.expert_kw
-        lay = mb.flat_routed_expert_plan(
-            self.mesh, Hr, I, epc, E, kw["max_tokens_per_expert"], weights_bf8=False, pin=1, layout=kw["layout"]
-        ).as_dict()
+        N = R * C
+        epc = self.dims.num_experts // N
         rw = self.host_sd["routed_expert_weights"]
+        E = self.dims.num_experts
         assert len(rw) == E, f"MoE block: {len(rw)} routed experts in the state dict, the model has {E}"
-        f = lambda t: t.float().T.contiguous()  # noqa: E731  ((out, in) Linear weights -> the flat op's [in, out])
         same = N > 1 and all(rw[n * epc + i] is rw[i] for n in range(1, N) for i in range(epc))
-        per_dev = [
-            [(f(rw[e]["gate_proj"]), f(rw[e]["up_proj"]), f(rw[e]["down_proj"])) for e in range(n * epc, (n + 1) * epc)]
-            for n in range(1 if same else N)
-        ]
-        # (every chip the same expert objects - a test's pool repeated: pack once, replicate; K3's 896 distinct
-        # experts packed a chip each would hold ~120 GB of fp32)
-        packed = [fw.flat_weight_regions(W_l, lay) for W_l in per_dev]
-        w_gu = fw.bank_sharded([p[0] for p in packed], lay["banks"], ttnn.bfloat4_b, self.mesh, replicate=same)
-        w_d = fw.bank_sharded([p[1] for p in packed], lay["banks"], ttnn.bfloat4_b, self.mesh, replicate=same)
-        gidx = ttnn.from_torch(
-            torch.arange(E, dtype=torch.int32).reshape(N, 1, epc),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=self.mesh,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-        )
-        return gidx, w_gu, w_d
+        srcs = []
+        for le in experts:
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                if same:
+                    x, mapper = rw[le][proj].T.contiguous().reshape(1, 1, *rw[le][proj].T.shape), None
+                else:
+                    x = torch.stack([rw[n * epc + le][proj].T for n in range(N)]).unsqueeze(1).contiguous()
+                    mapper = ttnn.ShardTensorToMesh(self.mesh, dim=0)
+                srcs.append(
+                    ttnn.from_torch(
+                        x,
+                        dtype=ttnn.bfloat4_b,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=self.mesh,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        mesh_mapper=mapper if mapper is not None else ttnn.ReplicateTensorToMesh(self.mesh),
+                    )
+                )
+                del x
+        return srcs
 
     def _host_sd_weights(self):
         """The non-routed weights from the state dict (the model's expert order: no permutation), as host_weights."""
@@ -432,7 +438,9 @@ class TtK3MoEBlockFfn:
 
                 pool = ThreadPoolExecutor(max_workers=1)
                 fut = pool.submit(host_weights, self.mesh, self.dims, self.layer_idx, self.hf_config)
-            gidx, w_gu, w_d = self._routed_host(block) if self.host_sd is not None else self._routed(block)
+            gidx, w_gu, w_d = (
+                self._routed(block, sources=self._host_sources) if self.host_sd is not None else self._routed(block)
+            )
             t1 = time.time()
             if cached is not None:
                 head, w_up = cached
