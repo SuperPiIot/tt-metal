@@ -143,7 +143,7 @@ CombineL1Plan plan_routed_experts_combine_l1(
     in.landing = combine.landing;
     in.credit_batch = combine.credit_batch;
     in.arena_bytes = out.arena_bytes;
-    if (!combine.landing || *combine.landing == CombineLanding::FlatCores) {  // (the flat cells' free tails)
+    if (!combine.landing || landing_on_flat(*combine.landing)) {  // (the flat cells' free L1)
         for (auto& f : fp->free_l1(out.arena_bytes)) {
             in.flat_free.push_back({std::move(f.cells), std::move(f.spans)});
         }

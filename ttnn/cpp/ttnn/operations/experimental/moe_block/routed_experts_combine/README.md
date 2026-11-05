@@ -24,8 +24,11 @@ accumulators).
   past CBs 6 / 7; `kernels/dataflow/combine_pool.hpp`) instead of the accumulator's L1, which then keeps its fp32 sums,
   CBs and deeper local / injection rings. The accumulator probes its slots' trailers
   (32 B reads, several slots a source at once), reads landed rows over the NoC (`kPoolRows` in flight) and clears a
-  taken slot's trailer before its credit goes back. With no `CombineConfig.landing` the planner plans both and keeps
-  the deeper rings (then the larger injection ring, then local ring). A port sends any row of the first 32 of its
+  taken slot's trailer before its credit goes back. `CombineLanding.SharedFlatCores`: the shared landing's slot grants
+  on those slots (accumulators apart from the ports). With no `CombineConfig.landing` the planner plans the rings both
+  ways and keeps the higher `combine_choice_key`: landing depth up to 3 slots a source, then at least half the most
+  accumulators, then the injection ring (to 64), then deeper landing, accumulators, the local ring - the same ranking
+  picks between accumulators on / apart from the ports. A port sends any row of the first 32 of its
   injection ring whose ring has room (not only its front row): with 1 slot a source, the front row's credit is a
   fabric round trip, and every row behind it waited for it.
 

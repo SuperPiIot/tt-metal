@@ -29,7 +29,9 @@ inline constexpr uint32_t kMiscRdone = 288;             // MISC words: rows cove
 inline constexpr uint32_t kMiscTaken = 320;             // MISC words: an accumulator's taken[] per ring
 inline constexpr uint32_t kAccMax = moe_block_plan_words::kAccMax;      // A_MAX: accumulators at most (the plan's want[])
 inline constexpr uint32_t kMaxChips = moe_block_plan_words::kMaxChips;  // N at most (want[][32], 32-bit chip masks)
-inline constexpr uint32_t kTabCbBytes = 256 * 8 + 128;  // CB_TAB: the device plan's scratch reads
+// CB_TAB: the device plan's scratch reads (accumulators: the plan's words, the shared landing's slot owners / free list
+// / grant queues, the flat cells' trailer probes - accumulator_reader.cpp)
+inline constexpr uint32_t kTabCbBytes = 256 * 10 + 128;
 inline constexpr uint32_t kWriterWordsRows = 192;       // the L1 hand-off writers' words: 64 B rows
 // shared landing: slot grants outstanding a (source, accumulator) at most (4: 2x4 GLM-5.3-Flash 1280 experts + combine
 // 560 / 694 / 1157 us at D 8 / 2 / 1 vs 584 / 688 / 1172 at 8, 591 / 699 / 1194 at 16)
@@ -110,7 +112,15 @@ enum class CombineMode : uint8_t { PortsApart = 0, AccOnPorts = 1 };
 // accumulator's: the accumulator keeps only its fp32 sums and CBs there, it learns a row landed by reading the slot's
 // trailer and takes the row with a NoC read (as it takes a local slot's), so deep rings cost the accumulators nothing.
 // (pool_slots: the flat cores' slots a chip, every accumulator's rings carved from them; 0 - in the accumulators' L1)
-enum class CombineLanding : uint8_t { Rings = 0, Shared = 1, FlatCores = 2 };
+// SharedFlatCores - Shared's slot grants, the slots in the flat cores' free L1 as FlatCores' (accumulators apart from
+// the ports only).
+enum class CombineLanding : uint8_t { Rings = 0, Shared = 1, FlatCores = 2, SharedFlatCores = 3 };
+inline bool landing_shared(CombineLanding l) {
+    return l == CombineLanding::Shared || l == CombineLanding::SharedFlatCores;
+}
+inline bool landing_on_flat(CombineLanding l) {
+    return l == CombineLanding::FlatCores || l == CombineLanding::SharedFlatCores;
+}
 
 // combine_auto: the combine's configuration from the cells the flat plan leaves (n_cells, port_cells of them the
 // ports') and the arena budget. mode: that mode only.
@@ -123,6 +133,15 @@ struct CombineAutoChoice {
     bool shared = false;  // CombineLanding::Shared
     CombineLayout layout;
 };
+// How combine_auto / the landing choice rank configurations: landing depth up to 3 slots a source, then keeping at
+// least half the most accumulators of the candidates (a_ref), then the injection ring (to 64 slots), then deeper
+// landing, more accumulators, the local ring. Galaxy GLM-5.3 (2026-11-05): wherever the depth-first ranking put the
+// accumulators on the ports for one more slot a source (an 8-slot injection ring), them apart (64 slots) was faster
+// at D >= 3 - 4x4 5120 1.43 / 1.34 vs 1.57 / 1.59 ms, 4x4 7680 on the flat cells 2.43 vs 2.93 - but apart at D 1
+// slower (2.369 vs 2.105); on the 2x4 LoudBox apart leaves 3 accumulators of 9 (GLM-5.3 1280 666 vs 645 us).
+std::tuple<uint32_t, bool, uint32_t, uint32_t, uint32_t, uint32_t> combine_choice_key(
+    const struct CombineAutoChoice& c, uint32_t a_ref);
+
 struct CombineAuto {
     bool fits = false;
     std::string why;

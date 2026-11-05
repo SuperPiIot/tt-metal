@@ -88,9 +88,6 @@ CombineLayout combine_l1_layout(
     if (shared && acc_on_ports) {
         return fail("shared landing: the accumulators apart from the ports only");
     }
-    if (shared && flat_pool) {
-        return fail("shared landing: in the accumulators' L1 only");
-    }
     const int64_t PSL = std::min<int64_t>(
         {static_cast<int64_t>(depth) * (N - 1), fit, shared ? int64_t(kSharedPslMax) : std::numeric_limits<int64_t>::max()});
     out.PSL = static_cast<int32_t>(PSL);
@@ -144,14 +141,19 @@ CombineAuto combine_auto(
     std::optional<CombineMode> mode,
     CombineLanding landing,
     uint32_t pool_slots) {
-    const bool shared = landing == CombineLanding::Shared;
-    if (landing != CombineLanding::FlatCores) {
+    const bool shared = landing_shared(landing);
+    if (!landing_on_flat(landing)) {
         pool_slots = 0;
     }
     CombineAuto res;
     std::vector<std::string> why;
     auto score = [](const CombineAutoChoice& c) {
-        return std::make_tuple(c.layout.D, c.inj_slots, c.local_keep, c.layout.PSL);
+        return std::make_tuple(
+            std::min<uint32_t>(c.layout.D, 3),
+            std::min<uint32_t>(c.layout.QP, 64),
+            c.layout.D,
+            c.local_keep,
+            c.layout.PSL);
     };
     for (const bool fused : {false, true}) {
         const int64_t cells = fused ? static_cast<int64_t>(n_cells) : static_cast<int64_t>(n_cells) - port_cells;
@@ -190,8 +192,17 @@ CombineAuto combine_auto(
             continue;
         }
         (fused ? res.acc_on_ports : res.ports_apart) = mode_best;
-        if (!res.best || mode_best->layout.D > res.best->layout.D) {
-            res.best = mode_best;
+    }
+    for (const auto* m : {&res.ports_apart, &res.acc_on_ports}) {  // (the modes ranked as combine_choice_key)
+        if (!m->has_value()) {
+            continue;
+        }
+        uint32_t a_ref = (*m)->n_acc;
+        for (const auto* o : {&res.ports_apart, &res.acc_on_ports}) {
+            a_ref = o->has_value() ? std::max(a_ref, (*o)->n_acc) : a_ref;
+        }
+        if (!res.best || combine_choice_key(**m, a_ref) > combine_choice_key(*res.best, a_ref)) {
+            res.best = *m;
         }
     }
     res.fits = res.best.has_value();
@@ -201,6 +212,17 @@ CombineAuto combine_auto(
         }
     }
     return res;
+}
+
+std::tuple<uint32_t, bool, uint32_t, uint32_t, uint32_t, uint32_t> combine_choice_key(
+    const CombineAutoChoice& c, uint32_t a_ref) {
+    return std::make_tuple(
+        std::min<uint32_t>(c.layout.D, 3),
+        2 * c.n_acc >= a_ref,
+        std::min<uint32_t>(c.layout.QP, 64),
+        static_cast<uint32_t>(c.layout.D),
+        c.n_acc,
+        c.layout.QL);
 }
 
 CreditPolicy credit_policy(uint32_t N, uint32_t D, bool shared, std::optional<uint32_t> batch) {

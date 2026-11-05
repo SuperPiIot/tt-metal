@@ -215,22 +215,21 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
             l,
             pool_slots);
     };
-    // no landing given: the rings in the accumulators' L1 or on the flat cells, whichever plans deeper rings (then the
-    // larger injection ring, then the larger local ring). 2x4 GLM-5.3-Flash experts + combine: chunk 5120 D 1 QP 8 ->
-    // D 8 QP 16 on the flat cells 2762 -> 1543 us, 1280 D 8 QL 3 -> D 8 QL 16 513 -> 489, 2560 702 -> 708
+    // no landing given: the rings in the accumulators' L1 or on the flat cells, whichever ranks higher
+    // (combine_choice_key). 2x4 GLM-5.3-Flash experts + combine: chunk 5120 D 1 QP 8 -> D 8 QP 16 on the flat cells
+    // 2762 -> 1543 us, 1280 D 8 QL 3 -> D 8 QL 16 513 -> 489, 2560 702 -> 708
     CombineLanding landing = in.landing.value_or(CombineLanding::Rings);
     auto au = plan_with(landing);
     if (!in.landing && pool_slots > 0) {
         auto fc = plan_with(CombineLanding::FlatCores);
-        auto key = [](const CombineAuto& x) {
-            return std::make_tuple(x.best->layout.D, x.best->layout.QP, x.best->layout.QL);
-        };
+        const uint32_t a_ref = std::max(au.fits ? au.best->n_acc : 0u, fc.fits ? fc.best->n_acc : 0u);
+        auto key = [&](const CombineAuto& x) { return combine_choice_key(*x.best, a_ref); };
         if (fc.fits && (!au.fits || key(fc) > key(au))) {
             au = std::move(fc);
             landing = CombineLanding::FlatCores;
         }
     }
-    const bool flat_pool = landing == CombineLanding::FlatCores;
+    const bool flat_pool = landing_on_flat(landing);
     TT_FATAL(
         !flat_pool || pool_slots > 0,
         "routed_experts_combine: FlatCores landing - no free slot on the flat cells (arena {} KB)",

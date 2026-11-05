@@ -431,7 +431,7 @@ void kernel_main() {
             if ((gw >> 24) != GTAG(u)) {
                 return false;
             }
-            dst = area + RINGS + (gw & 0xFFFF) * SLOT;
+            dst = gw & 0xFFFF;  // (the granted slot)
         } else {
             const uint32_t lw = lay_r[ci], dep = lw & 0xFFF;
             if ((lw >> 24) != tag) {
@@ -446,7 +446,7 @@ void kernel_main() {
         if constexpr (POOL) {
             dn = rec_pool_noc(pool_a, area, SLOT, o * PSL + dst);
         } else {
-            dn = get_noc_addr(ACC_X(home, o), ACC_Y(home, o), SHARED ? dst : area + RINGS + dst * SLOT);
+            dn = get_noc_addr(ACC_X(home, o), ACC_Y(home, o), area + RINGS + dst * SLOT);
         }
         constexpr uint32_t pb = row_bytes + 32;
         auto* h = hdr_at(home, sent % NH);

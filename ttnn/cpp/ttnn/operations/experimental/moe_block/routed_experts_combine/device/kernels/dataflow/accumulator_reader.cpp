@@ -52,7 +52,6 @@ constexpr uint32_t SHARED = 0, G = 1, GIDH = 0;
 // before the credit goes back (trailers zeroed each call).
 #ifdef REC_POOL
 constexpr uint32_t POOL = 1, PROWS = REC_POOL_ROWS;
-static_assert(!SHARED, "the shared landing: in the accumulators' L1 only");
 #else
 constexpr uint32_t POOL = 0, PROWS = 2;
 #endif
@@ -191,8 +190,10 @@ void kernel_main() {
     // a source's granted slots in grant order - it fills them in that order (one port, one path), so its oldest
     // outstanding grant, at (issued - outstanding) % G, is the only one to check
     volatile tt_l1_ptr uint16_t* gq = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(sc + 1024);
-    const uint32_t probe = sc + 1024;  // (REC_POOL, rings only: each source's next slots' trailers, 32 B a slot)
-    const uint32_t zero32 = sc + 2048;  // (REC_POOL: 32 B of zeros - a taken slot's trailer)
+    // (REC_POOL: each source's next slots' trailers, 32 B a slot - past the shared landing's grant queues; then 32 B of
+    // zeros, a taken slot's trailer)
+    const uint32_t probe = SHARED ? sc + 1280 : sc + 1024;
+    const uint32_t zero32 = SHARED ? sc + 2304 : sc + 2048;
     if constexpr (POOL) {
         for (uint32_t w = 0; w < 8; ++w) {
             reinterpret_cast<volatile tt_l1_ptr uint32_t*>(zero32)[w] = 0;
@@ -358,6 +359,36 @@ void kernel_main() {
             flush_rows();
         }
     };
+    // shared, REC_POOL: source k's oldest granted slot i on its flat cell (its trailer probed into tr): the row read,
+    // its trailer cleared there, the slot free (granted again only once the caller has fenced the clears)
+    auto take_pool_slot = [&](uint32_t i, uint32_t k, volatile tt_l1_ptr uint32_t* tr) {
+        const uint64_t sn = pool_noc(i);
+        cb_reserve_back(cb_w, 1);
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_w))[0] = tr[1] & 0xFFFF;
+        cb_push_back(cb_w, 1);
+        cb_reserve_back(cb_row, NT * (inflight + 1));
+        cb_reserve_back(cb_meta, inflight + 1);
+        uint32_t rp = get_write_ptr(cb_row) + inflight * NT * get_local_cb_interface(cb_row).fifo_page_size;
+        if (rp >= get_local_cb_interface(cb_row).fifo_limit) {
+            rp -= get_local_cb_interface(cb_row).fifo_size;
+        }
+        uint32_t mp = get_write_ptr(cb_meta) + inflight * get_local_cb_interface(cb_meta).fifo_page_size;
+        if (mp >= get_local_cb_interface(cb_meta).fifo_limit) {
+            mp -= get_local_cb_interface(cb_meta).fifo_size;
+        }
+        noc_async_read(sn, rp, row_bytes);
+        noc_async_write(zero32, sn + LASTPB, 32);
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(mp)[0] = ((tr[0] >> 8) & 0xFFFF) / A;
+        own[i] = 0xFF;
+        fstack[nfree++] = static_cast<uint16_t>(i);
+        taken[k] = taken[k] + 1;
+        --want[k];
+        --gout[k];
+        ++done;
+        if (++inflight == PROWS) {
+            flush_rows();
+        }
+    };
     auto take_slot = [&](uint32_t i) -> bool {  // shared: slot i's row, if it landed
         const uint32_t s = area + RINGS + i * SLOT;
         volatile tt_l1_ptr uint32_t* tr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(s + LASTPB);
@@ -383,7 +414,37 @@ void kernel_main() {
                 break;
             }
         }
-        if constexpr (SHARED) {  // (each source's oldest grant only; freed slots granted again at once)
+        if constexpr (SHARED && POOL) {  // (each source's oldest PP grants probed at once, the landed rows taken)
+            uint32_t np[N];
+            for (uint32_t k = 0; k < N; ++k) {
+                const uint32_t n = gout[k] < PP ? gout[k] : PP;
+                np[k] = n;
+                for (uint32_t j = 0; j < n; ++j) {
+                    noc_async_read(
+                        pool_noc(gq[k * G + (giss[k] - gout[k] + j) % G]) + LASTPB, probe + 32 * (k * PP + j), 32);
+                }
+            }
+            noc_async_read_barrier();
+            bool any = false;
+            for (uint32_t k = 0; k < N; ++k) {
+                for (uint32_t j = 0; j < np[k]; ++j) {
+                    volatile tt_l1_ptr uint32_t* tr =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(probe + 32 * (k * PP + j));
+                    if (tr[3] == 0 || tr[7] == 0) {
+                        break;
+                    }
+                    take_pool_slot(gq[k * G + (giss[k] - gout[k]) % G], k, tr);
+                    any = true;
+                }
+            }
+            if (any) {  // (the slots granted again once their rows are read and their trailers cleared)
+                if (inflight) {
+                    flush_rows();
+                }
+                noc_async_write_barrier();
+                regrant();
+            }
+        } else if constexpr (SHARED) {  // (each source's oldest grant only; freed slots granted again at once)
             bool any = false;
             for (uint32_t k = 0; k < N; ++k) {
                 while (gout[k] && take_slot(gq[k * G + (giss[k] - gout[k]) % G])) {
