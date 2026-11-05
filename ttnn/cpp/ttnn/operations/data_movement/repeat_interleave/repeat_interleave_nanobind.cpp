@@ -26,7 +26,7 @@ void bind_repeat_interleave(nb::module_& mod) {
             dim (int): the dimension along which to repeat. Negative values count from the last dimension.
 
         Keyword Args:
-            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`: an interleaved input keeps its memory configuration. For sharded inputs, see Memory Support.
+            memory_config (ttnn.MemoryConfig, optional): Memory configuration for the operation. Defaults to `None`: an interleaved input, or any input with ``repeats=1``, keeps its memory configuration. For a sharded input with ``repeats`` > 1, see Memory Support. A given ``memory_config`` sets the output's memory configuration.
 
         Returns:
             ttnn.Tensor: the output tensor, with the same dtype and layout as the input.
@@ -46,8 +46,8 @@ void bind_repeat_interleave(nb::module_& mod) {
 
         Memory Support:
             - Interleaved: DRAM and L1
-            - Sharded, with ``repeats`` > 1: a ROW_MAJOR rank-4 input that is HEIGHT_SHARDED, WIDTH_SHARDED or BLOCK_SHARDED in L1 stays sharded, except that repeating the last dimension of a WIDTH_SHARDED or BLOCK_SHARDED input gives an L1 interleaved output. HEIGHT_SHARDED and BLOCK_SHARDED inputs on this path need a device opened with a non-zero ``l1_small_size``.
-            - TILE sharded inputs, DRAM-sharded inputs and sharded inputs of rank other than 4 are first converted to DRAM interleaved, which gives a DRAM interleaved output
+            - Sharded, with ``repeats`` > 1 and no ``memory_config``: a ROW_MAJOR rank-4 input that is HEIGHT_SHARDED, WIDTH_SHARDED or BLOCK_SHARDED in L1 keeps the same sharding when a dimension other than the last is repeated. Repeating the last dimension gives an L1 output whose sharding depends on the shard geometry. HEIGHT_SHARDED and BLOCK_SHARDED inputs on this path need a device opened with a non-zero ``l1_small_size``.
+            - With ``repeats`` > 1 and no ``memory_config``, TILE sharded inputs, DRAM-sharded inputs and sharded inputs of rank other than 4 are first converted to DRAM interleaved and give a DRAM interleaved output
     )doc";
 
     ttnn::bind_function<"repeat_interleave">(
