@@ -36,6 +36,7 @@ from loguru import logger
 
 import ttnn
 from models.demos.moe_block.tt.flat_gather import flat_face_map, flat_weights_module, gather, gather_batches
+from models.demos.deepseek_v3_d_p.tt.moe_impl import moe_block_words_slab
 from models.demos.moe_block.tt.moe_block import MoEBlock, MoEBlockWeights
 
 LINKS = 2
@@ -266,8 +267,10 @@ class TtK3MoEBlockFfn:
                 combine_snap=opts.combine_snap,
                 persist_l1_small=True,  # (the ops' words in L1_SMALL: MoEBlock)
             )
-            if opts.words_slab_bytes is not None:
-                cfg.words_slab_bytes = opts.words_slab_bytes
+            # (the model's slab, the one its mesh opened L1_SMALL for: moe_impl.moe_block_words_slab)
+            cfg.words_slab_bytes = (
+                opts.words_slab_bytes if opts.words_slab_bytes is not None else moe_block_words_slab(self.model_name)
+            )
             dtypes = mb.MoEDtypes()
             t0 = time.time()
             res = mb.MoEBlockResources(self.mesh, self.dims, cfg, dtypes)

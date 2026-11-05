@@ -39,21 +39,38 @@ _MODEL_L1_SMALL = {
 }
 _L1_SMALL_ALIGN = 64  # (the allocator's alignment of the slab and of the model's last buffer)
 
+# The persistent words' slab a core, where the model's word sets need less than MoEBlockConfig.words_slab_bytes:
+# - Kimi-K3: 1920 B (1904 B used at 8x4 chunk 5120, the tail's words now per-call CBs). The default 2304 put the
+#   mesh's L1_SMALL at 3584 B, which pushed the K3 L24 model's top L1 buffer (5376 B) into ring_mla's static CBs
+#   (their region ends at 1564224: L1_SMALL <= 3264 B clears it); 1920 gives 3152 B.
+_MODEL_WORDS_SLAB = {
+    "KimiK3Config": 1920,
+}
 
-def moe_block_l1_small() -> int:
-    """L1_SMALL the MoE block holds a bank: its persistent words' slab (MoEBlockConfig.words_slab_bytes, sized so every
-    word set of the block fits, the fused tail's included) plus the allocator's alignment."""
+
+def _model_name(model_cfg) -> Optional[str]:
+    return model_cfg if isinstance(model_cfg, str) else getattr(model_cfg, "__name__", None)
+
+
+def moe_block_words_slab(model_cfg=None) -> int:
+    """The MoE block's persistent words' slab a core for this model (MoEBlockConfig.words_slab_bytes by default)."""
     import ttnn
 
-    return int(ttnn.experimental.moe_block.MoEBlockConfig().words_slab_bytes) + _L1_SMALL_ALIGN
+    default = int(ttnn.experimental.moe_block.MoEBlockConfig().words_slab_bytes)
+    return _MODEL_WORDS_SLAB.get(_model_name(model_cfg), default)
+
+
+def moe_block_l1_small(model_cfg=None) -> int:
+    """L1_SMALL the MoE block holds a bank: its persistent words' slab (moe_block_words_slab, sized so every word set
+    of the block fits) plus the allocator's alignment."""
+    return moe_block_words_slab(model_cfg) + _L1_SMALL_ALIGN
 
 
 def model_l1_small_with_block(model_cfg, l1_small_size: int) -> int:
     """L1_SMALL a mesh of this model opens with when the MoE block is its MoE: the model's own use (its l1_small_size,
     or the measured figure where that is not one) plus the block's, at least l1_small_size."""
-    name = model_cfg if isinstance(model_cfg, str) else getattr(model_cfg, "__name__", None)
-    own = _MODEL_L1_SMALL.get(name, l1_small_size)
-    return max(l1_small_size, own + moe_block_l1_small())
+    own = _MODEL_L1_SMALL.get(_model_name(model_cfg), l1_small_size)
+    return max(l1_small_size, own + moe_block_l1_small(model_cfg))
 
 
 def moe_impl_of(model_cfg=None, moe_impl: Optional[str] = None) -> str:
