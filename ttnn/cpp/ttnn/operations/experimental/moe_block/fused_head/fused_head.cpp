@@ -55,6 +55,8 @@ HeadShape head_shape_of(
     using tt::tt_metal::DataType;
     HeadShape s;
     s.rows = config.loop_tokens() / topology.R;
+    s.loops = config.loops();
+    s.splits = config.splits();
     s.H = dims.emb_dim;
     s.I = dims.shared_expert_hidden_dim.value_or(0) / topology.C;
     s.G = topology.C;
@@ -276,8 +278,16 @@ const FusedHeadSetup& setup_fused_head(
             setup.words.push_back(static_cast<uint32_t>(t.buffer()->address()));
         }
         setup.inputs = persistent_inputs(resources, *setup.model);
-        setup.patches = std::make_shared<HeadPatchStore>();
-        setup.patches_padded = std::make_shared<HeadPatchStore>();
+        const uint32_t loops = cfg.loops();
+        setup.y_loops.push_back(setup.inputs.y);
+        for (uint32_t i = 1; i < loops; ++i) {
+            setup.y_loops.push_back(
+                resources.persistent_tensor("fused_head/y" + std::to_string(i), setup.inputs.y.tensor_spec()));
+        }
+        for (uint32_t i = 0; i < loops * cfg.splits(); ++i) {
+            setup.patches.push_back(std::make_shared<HeadPatchStore>());
+            setup.patches_padded.push_back(std::make_shared<HeadPatchStore>());
+        }
         return setup;
     });
 }
@@ -320,7 +330,12 @@ FusedHeadOutputs fused_head(
     uint32_t loop) {
     using namespace fused_head_entry_detail;
     const uint32_t loops = resources.config().loops();
-    TT_FATAL(loop < loops, "fused_head: loop {} of {} token loops", loop, loops);
+    TT_FATAL(
+        loop < loops * resources.config().splits(),
+        "fused_head: loop {} of {} splits x {} token loops",
+        loop,
+        resources.config().splits(),
+        loops);
     const auto& setup = setup_fused_head(resources, dtypes, accumulators, l1_free);
     FusedHeadParams params{
         .config = setup.config,
@@ -328,10 +343,11 @@ FusedHeadOutputs fused_head(
         .model = setup.model,
         .words = setup.words,
         .arena = arena ? *arena : default_arena(resources, setup),
-        .patches = actual_start ? setup.patches_padded : setup.patches,
+        .patches = actual_start ? setup.patches_padded[loop] : setup.patches[loop],
         .loops = loops,
         .loop = loop};
     auto in = call_inputs(setup, x, weights, x_full);
+    in.y = setup.y_loops[loop % loops];
     in.actual_start = actual_start;
     in.actual_end = actual_end;
     FusedHeadOutputs out{

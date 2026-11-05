@@ -230,9 +230,14 @@ public:
     // the mailbox words
     uint32_t HS = 16, fslots = 16, lw_off = 0, port_words = 16, zw_off = 0, mbox_words = 0;
     // routing
-    uint32_t S = 0, EPC = 0, A = 0, Lr = 2, M = 0, NF = 16, rows_cap = 0, inst_cap = 0;
+    uint32_t S = 0, SA = 0, loops = 1, splits = 1, EPC = 0, A = 0, Lr = 2, M = 0, NF = 16, rows_cap = 0, inst_cap = 0;
     int64_t pl_step = 0, plan_l1 = 0, HBP = 0, BB = 0, BBP = 0, PCAP = 0, MAXP = 0;
     std::vector<int64_t> pbases_off;  // the planner instances' regions, arena offsets
+    // token loops: an earlier loop's planner (no token): its instances' regions past the router's bytes, its caps
+    std::vector<int64_t> pbases_idle;
+    uint32_t rows_cap_idle = 0, inst_cap_idle = 0;
+    // token loops: a forwarding port's L1 scratch slots, reused in turn (0: one a forwarded packet)
+    uint32_t fwd_ring = 0;
     int64_t xbase_off = 0, fbase_off = 0;
     int64_t xg_off = 0, xg_bytes = 0;  // the x-gather packet staging on the port cores (kXgCb), arena offset / bytes
     uint32_t nx = 0, ny = 0;
@@ -793,7 +798,7 @@ std::shared_ptr<const HeadModel> make_head_model(
     TT_FATAL(h.rcores.size() >= h.RBi, "fused_head: {} router cores < {}", h.rcores.size(), h.RBi);
     h.rcores.resize(h.RBi);
     {
-        std::tie(h.roff, h.rbytes) = router_layout(G, h.ET, h.K, h.ET);
+        std::tie(h.roff, h.rbytes) = router_layout(G, h.ET, h.K, h.ET, sh.loops > 1);
         TT_FATAL(
             h.rbytes <= h.arena_bytes, "fused_head: router cores need {} B of the arena's {}", h.rbytes, h.arena_bytes);
         h.NS = u32(cdiv(h.rcores.size(), h.L));
@@ -802,41 +807,39 @@ std::shared_ptr<const HeadModel> make_head_model(
 
     // the routing exchange (RoutingStream)
     h.S = sh.rows / G;
+    h.SA = sh.SA();  // (the planner and the exchange: every token loop's tokens)
+    h.loops = sh.loops;
+    h.splits = sh.splits;
     h.EPC = sh.EPC();
     h.A = sh.A;
-    h.rows_cap = u32(routing_worst_rows(h.N, h.S, h.K, h.EPC));
+    h.rows_cap = u32(routing_worst_rows(h.N, h.SA, h.K, h.EPC));
     {
         const uint32_t nc = u32(h.rcores.size());
-        RoutingSizes sz{};
-        int64_t step = 0, pl0 = 0;
-        uint32_t M = std::min({2 * nc, h.EPC, h.A, 14u});
-        bool ok = false;
-        for (; M > 0; --M) {
-            sz = routing_a2a_sizes(h.N, h.S, h.K, h.EPC, h.A, h.rows_cap, M);
-            step = al64(sz.plan_l1);
-            const int64_t per = cdiv(M, nc);
-            pl0 = per * step <= std::get<1>(*std::find_if(
-                                    h.roff.begin(), h.roff.end(), [](const auto& r) { return r.first == "bias"; }))
-                      ? 0
-                      : al64(h.rbytes);
-            if (sz.fits && pl0 + per * step <= h.arena_bytes) {
-                ok = true;
-                break;
-            }
+        const int64_t bias =
+            std::get<1>(*std::find_if(h.roff.begin(), h.roff.end(), [](const auto& r) { return r.first == "bias"; }));
+        const auto pp = place_planner(h.N, h.SA, h.K, h.EPC, h.A, nc, bias, h.rbytes, h.arena_bytes);
+        TT_FATAL(pp.ok, "fused_head: routing planner: no room ({})", pp.sz.why);
+        h.M = pp.M;
+        h.inst_cap = u32(pp.sz.inst_cap);
+        h.plan_l1 = pp.sz.plan_l1;
+        h.pl_step = pp.step;
+        for (uint32_t q = 0; q < h.M; ++q) {
+            h.pbases_off.push_back(pp.pl0 + int64_t(q / nc) * pp.step);
         }
-        TT_FATAL(ok, "fused_head: routing planner: no room ({})", sz.why);
-        h.M = M;
-        h.inst_cap = u32(sz.inst_cap);
-        h.plan_l1 = sz.plan_l1;
-        h.pl_step = step;
-        for (uint32_t q = 0; q < M; ++q) {
-            h.pbases_off.push_back(pl0 + int64_t(q / nc) * step);
+        if (h.loops > 1) {  // (an earlier token loop's planner: the same instances, no token, past the router's bytes)
+            const auto idle = place_planner(h.N, kPlannerIdleS, h.K, h.EPC, h.A, nc, 0, h.rbytes, h.arena_bytes, h.M);
+            TT_FATAL(idle.ok, "fused_head: an earlier token loop's routing planner: no room ({})", idle.sz.why);
+            h.rows_cap_idle = u32(routing_worst_rows(h.N, kPlannerIdleS, h.K, h.EPC));
+            h.inst_cap_idle = u32(idle.sz.inst_cap);
+            for (uint32_t q = 0; q < h.M; ++q) {
+                h.pbases_idle.push_back(idle.pl0 + int64_t(q / nc) * idle.step);
+            }
         }
     }
     h.HBP = routing_header_bytes(h.EPC, h.M);
     h.BB = al16(2 * int64_t(h.EPC));
     h.BBP = al16(2 * (int64_t(h.EPC) + 1));
-    h.PCAP = routing_slot_bytes(h.S, h.K, h.EPC, h.M);
+    h.PCAP = routing_slot_bytes(h.SA, h.K, h.EPC, h.M);
     h.MAXP = int64_t(h.payload) / 64 * 64;
     h.NF = h.fslots;
     for (const auto& [coord, _] : h.chips) {
@@ -879,6 +882,10 @@ std::shared_ptr<const HeadModel> make_head_model(
     uint32_t nf = 0;
     for (const auto& [_, v] : h.fwd) {
         nf = std::max(nf, u32(v.size()));
+    }
+    if (h.loops > 1 && nf > kFwdRing) {  // (token loops: the whole chunk's packets - the forwarder reuses kFwdRing)
+        h.fwd_ring = kFwdRing;
+        nf = kFwdRing;
     }
     // (the arena grows to the ports' logits partials + routing buffers, and to the watcher's Y buffers, up to its cap -
     // head_plan's cores_check)
@@ -1193,6 +1200,9 @@ private:
         }
     }
     void planner_defines(KernelDescriptor& k, uint32_t ct0) const;
+    // token loops: an earlier loop's planner plans no token (the exchange runs empty: the chips' barrier)
+    bool idle_planner() const { return bufs.loop + 1 < bufs.loops; }
+    const std::vector<int64_t>& pbases() const { return idle_planner() ? h.pbases_idle : h.pbases_off; }
     std::function<Args(uint32_t)> planner_args() const;
     Args ra_args(uint32_t j) const;
     Args ra_args2(uint32_t j) const;
@@ -1313,8 +1323,9 @@ Args ChipProgram::rs_ncrisc(uint32_t cx, uint32_t cy) const {
 std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> ChipProgram::prep_units(
     uint32_t cx, uint32_t cy) const {
     const uint32_t MT = e.MT, KB = e.KB, G = e.shards;
+    // (the dispatch buffer's slots: chip me's at me x SA, this token loop's at loop x S in them)
+    const uint32_t row0 = me * h.SA + bufs.loop * h.S;
     const uint32_t RBo = e.rows / 32 / G;
-    const uint32_t row0 = me * RBo * 32;
     std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> out;
     if (e.LT) {
         const auto [r0, nr] = e.la_rows(cy, p);
@@ -2149,14 +2160,22 @@ void ChipProgram::routing_defines(KernelDescriptor& k) const {
              {"RA_NF_", h.NF}}) {
         define(k, n, iv(v));
     }
+    if (h.fwd_ring) {
+        define(k, "RA_FWD_RING", iv(h.fwd_ring));
+    }
 }
 
 // router_stream._ra_src: the planner as ra::plan (RAP_* = RoutingStream.kernel_subs)
 void ChipProgram::planner_defines(KernelDescriptor& k, uint32_t ct0) const {
     define(k, "RA_PLAN");
+    const bool idle = idle_planner();
+    if (idle) {  // (token loops: an earlier loop's planner plans no token - the exchange still runs, the chips' barrier
+                 // between loops; the last plans every loop's)
+        define(k, "RAP_SV0");
+    }
     routing_defines(k);
     for (const auto& [n, v] : std::vector<std::pair<std::string, int64_t>>{
-             {"RAP_S", h.S},
+             {"RAP_S", idle ? kPlannerIdleS : h.SA},
              {"RAP_K", h.K},
              {"RAP_EPC", h.EPC},
              {"RAP_R", h.R},
@@ -2172,8 +2191,8 @@ void ChipProgram::planner_defines(KernelDescriptor& k, uint32_t ct0) const {
              {"RAP_BBP", h.BBP},
              {"RAP_PCAP", h.PCAP},
              {"RAP_NPORT", int64_t(sv.size())},
-             {"RAP_ROWS_CAP", h.rows_cap},
-             {"RAP_ENT_CAP", h.inst_cap},
+             {"RAP_ROWS_CAP", idle ? h.rows_cap_idle : h.rows_cap},
+             {"RAP_ENT_CAP", idle ? h.inst_cap_idle : h.inst_cap},
              {"RAP_WX", int64_t(h.ring)},
              {"RAP_WY", int64_t(h.wrap_y)},
              {"RAP_CT0", ct0}}) {
@@ -2313,7 +2332,7 @@ std::function<Args(uint32_t)> ChipProgram::planner_args() const {
         pxy.push_back(u32(v.y));
     }
     Args inst;
-    for (int64_t pb : h.pbases_off) {
+    for (int64_t pb : pbases()) {
         inst.push_back(base + u32(pb));
     }
     for (uint32_t q = 0; q < h.M; ++q) {
@@ -2368,7 +2387,7 @@ Args ChipProgram::ra_args(uint32_t j) const {
         add(a, pxy);
         return a;
     }
-    Args a = {ra.at("rows"), ra.at("rows2"), base + u32(h.pbases_off[j])};
+    Args a = {ra.at("rows"), ra.at("rows2"), base + u32(pbases()[j])};
     add(a, pxy);
     add(a, planner_args()(j));
     return a;
@@ -2379,7 +2398,7 @@ Args ChipProgram::ra_args2(uint32_t j) const {
     if (q >= h.M) {
         return {ra.at("rows2"), 0u};
     }
-    Args a = {ra.at("rows2"), base + u32(h.pbases_off[q])};
+    Args a = {ra.at("rows2"), base + u32(pbases()[q])};
     add(a, planner_args()(q));
     return a;
 }
@@ -2456,9 +2475,9 @@ std::vector<KernelDescriptor> ChipProgram::router(std::vector<CBDescriptor>& cbs
         c_rt.emplace_back(core, c);
         const uint32_t jr = j % RB;
         Args b = {S(SRC_ROWS)};
-        add(b, jr);
+        add(b, jr + bufs.loop * RB);  // (token loops: this loop's owned rows after the earlier loops')
         add(b, Args{scale_bits, RA("out"), RA("words"), RA("best"), RA("route")});
-        b.push_back(S(SRC_ROUTE));
+        b.push_back(S(SRC_ROUTE) + bufs.loop * h.S * 4 * route_words(h.N));  // (one page: this loop's words on)
         add(b, Args{32 * jr, sv_});
         if (h.NIT > 1) {  // (router iterations: RT_ITA args before the planner's - am I router core 0, then iter_args)
             add(b, u32(j == 0));
@@ -2503,19 +2522,23 @@ std::vector<KernelDescriptor> ChipProgram::router(std::vector<CBDescriptor>& cbs
     // the SP row r, [5] SP rows, [6] tokens a row) less the row's tokens before mine ([7] p S, my owned block p), [8]
     // S; absent, the programs are the unpadded ones. Token loops: the row holds loops sub-chunks of S C tokens one
     // after another, this call's the loop-th - [6] the whole row's tokens, [7] the sub-chunk's first row in it plus p S
+    // ([9] the sub-chunk's rows, [10] the loops, [11] p S: the planner counts every loop's real tokens of mine)
     const bool padded = bufs[SRC_START] != nullptr;
     Args common_v = common;
-    if (padded) {
-        const uint32_t sub = h.S * h.C;
+    if (padded) {  // (splits: the row holds splits x loops calls' rows; this split's first is split x loops)
+        const uint32_t sub = h.S * h.C, g0 = bufs.split * bufs.loops;
         add(common_v,
             Args{
                 S(SRC_START),
                 S(SRC_END),
                 Arg(coord.first),
                 Arg(h.R),
-                Arg(sub * bufs.loops),
-                Arg(bufs.loop * sub + p * h.S),
-                Arg(h.S)});
+                Arg(sub * bufs.loops * h.splits),
+                Arg((g0 + bufs.loop) * sub + p * h.S),
+                Arg(h.S),
+                Arg(sub),
+                Arg(bufs.loops),
+                Arg(g0 * sub + p * h.S)});
     }
     auto iter_defs = [&](KernelDescriptor& k) {  // (router iterations: RT_NIT of them, RT_RBI router cores)
         if (h.NIT > 1) {
@@ -2688,11 +2711,13 @@ HeadTensorShapes head_tensor_shapes(const HeadModel& h) {
     const bool width = sh.rs_dim() == -1;
     s.y_rows = width ? sh.rows : sh.rows / h.G;
     s.y_cols = width ? sh.H / h.G : sh.H;
-    s.rows_rows = h.RB;
+    // (token loops: the routing rows, the dispatch buffer and the route words hold every loop's tokens, each call its
+    // own at loop x S; the shared expert's output is the call's)
+    s.rows_rows = h.RB * h.loops;
     s.rows_cols = 32 * 2 * h.K;
-    s.xbuf_rows = h.N * sh.rows / h.G;
+    s.xbuf_rows = h.N * h.SA;
     s.xbuf_cols = sh.latent.value_or(sh.H);
-    s.route_words = route_words(h.N) * sh.rows / h.G;
+    s.route_words = route_words(h.N) * h.SA;
     s.slot_words = u32(h.PCAP / 4);
     s.slots_rows = 2 * h.N;
     s.fslots_rows = std::max<uint32_t>(1, u32(h.fkeys.size())) * h.NF;

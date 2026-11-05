@@ -1306,7 +1306,7 @@ bool SeEngineSizing::fin_rows() const {
 // ---------------------------------------------------------------------------------------------------------------------
 // RouterStream / routing_a2a
 
-std::pair<Regions, int64_t> router_layout(uint32_t G, uint32_t ET, uint32_t K, uint32_t ETF) {
+std::pair<Regions, int64_t> router_layout(uint32_t G, uint32_t ET, uint32_t K, uint32_t ETF, bool arr_first) {
     ETF = ETF ? ETF : ET;
     Regions spec = {
         {"hold", int64_t(G) * ET * 4096},
@@ -1326,6 +1326,9 @@ std::pair<Regions, int64_t> router_layout(uint32_t G, uint32_t ET, uint32_t K, u
     };
     if (ETF != ET) {
         spec.emplace_back("part", 2 * 4096);
+    }
+    if (arr_first) {
+        std::swap(spec[4], spec[5]);
     }
     Regions off;
     int64_t o = 0;
@@ -1398,6 +1401,38 @@ RoutingSizes routing_a2a_sizes(
         w += (i ? "; " : "") + why[i];
     }
     return RoutingSizes{M, IC, plan_l1, port_l1, why.empty(), w};
+}
+
+PlannerPlace place_planner(
+    uint32_t N,
+    uint32_t S,
+    uint32_t K,
+    uint32_t EPC,
+    uint32_t A,
+    uint32_t nc,
+    int64_t overlay,
+    int64_t rbytes,
+    int64_t arena,
+    uint32_t fixed_M) {
+    PlannerPlace p;
+    const int64_t rows_cap = routing_worst_rows(N, S, K, EPC);
+    uint32_t M = fixed_M ? fixed_M : std::min({2 * nc, EPC, A, 14u});
+    for (; M > 0; --M) {
+        p.sz = routing_a2a_sizes(N, S, K, EPC, A, rows_cap, M);
+        p.step = al64(p.sz.plan_l1);
+        const int64_t per = ceil_div(int64_t(M), int64_t(nc));
+        p.pl0 = !fixed_M && per * p.step <= overlay ? 0 : al64(rbytes);
+        if (p.sz.fits && p.pl0 + per * p.step <= arena) {
+            p.ok = true;
+            p.M = M;
+            return p;
+        }
+        if (fixed_M) {
+            break;
+        }
+    }
+    p.M = M;
+    return p;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

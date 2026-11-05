@@ -219,7 +219,11 @@ struct SeEngineSizing {
 
 // ---- router_stream.RouterStream ----
 // (offsets, bytes) of the router cores' arena regions.
-std::pair<Regions, int64_t> router_layout(uint32_t G, uint32_t ET, uint32_t K, uint32_t ETF = 0);
+// arr_first (token loops): the peers' logits arrivals before the bias, so the last loop's routing planner overlays them
+// too (they are dead once every router core's rows are written; an earlier loop's planner never overlays them - a peer
+// one loop ahead writes its next logits there)
+std::pair<Regions, int64_t> router_layout(
+    uint32_t G, uint32_t ET, uint32_t K, uint32_t ETF = 0, bool arr_first = false);
 int64_t router_min_bytes(uint32_t G, uint32_t E, uint32_t K);
 
 // ---- combine_rf/routing_a2a.py ----
@@ -235,6 +239,31 @@ struct RoutingSizes {
 RoutingSizes routing_a2a_sizes(
     uint32_t N, uint32_t S, uint32_t K, uint32_t EPC, uint32_t A, int64_t rows_cap, uint32_t M = 0, uint32_t TPP = 32);
 
+// The routing planner's instances on the router cores (nc of them, two RISCs each): the most instances M (<= 2 nc,
+// EPC, A, 14) whose regions (ceil(M / nc) a core, step bytes each) fit - over the router's dead buffers [0, overlay)
+// when they fit there, else past the router's bytes - in the arena. fixed_M: that many (an earlier token loop's
+// planner: the last's instances, its regions past the router's bytes).
+struct PlannerPlace {
+    bool ok = false;
+    uint32_t M = 0;
+    RoutingSizes sz{};
+    int64_t step = 0, pl0 = 0;
+};
+PlannerPlace place_planner(
+    uint32_t N,
+    uint32_t S,
+    uint32_t K,
+    uint32_t EPC,
+    uint32_t A,
+    uint32_t nc,
+    int64_t overlay,
+    int64_t rbytes,
+    int64_t arena,
+    uint32_t fixed_M = 0);
+// an earlier token loop's planner plans no token: sized for one row tile
+inline constexpr uint32_t kPlannerIdleS = 32;
+// token loops: a forwarding port's L1 scratch slots (the whole chunk's packets), reused in turn
+inline constexpr uint32_t kFwdRing = 2;
 // ---- head_plan.routing_paths ----
 struct RoutingPaths {
     uint32_t nx;     // the most packets an X sender sends

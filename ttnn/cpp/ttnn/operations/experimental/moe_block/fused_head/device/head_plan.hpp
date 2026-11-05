@@ -49,10 +49,15 @@ struct HeadShape {
     uint32_t payload = 8256;  // the fabric's packet payload bytes
     uint32_t A = 16;          // the combine's accumulators
     WeightDtype w_dtype = WeightDtype::Bf8;
+    // token loops: a chunk's mesh row runs as `loops` head calls of `rows` rows each (MoEBlockConfig.token_loops);
+    // the routing planner and exchange are sized for all of them (SA tokens a chip) and plan them in the last call
+    uint32_t loops = 1;
+    uint32_t splits = 1;  // the block's splits (chunk_splits): a padded chunk's rows of the whole chunk
 
     int rs_dim() const { return latent ? -1 : -2; }
     uint32_t N() const { return R * G; }
     uint32_t S() const { return rows / G; }
+    uint32_t SA() const { return S() * loops; }  // a chip's owned tokens of the whole chunk (every loop's)
     uint32_t EPC() const { return E / fold / N(); }
     bool operator==(const HeadShape&) const = default;
 };

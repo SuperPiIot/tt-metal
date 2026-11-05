@@ -105,7 +105,7 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
     }
     const uint32_t nc = nrt;
     const uint32_t ET = shape.E / 32;
-    const auto [roff, rbytes] = router_layout(G, ET, shape.K, ET);
+    const auto [roff, rbytes] = router_layout(G, ET, shape.K, ET, shape.loops > 1);
     if (rbytes > arena) {
         return "router cores: " + kb0(rbytes) + " KB > the arena's " + kb0(arena) + " KB";
     }
@@ -114,39 +114,39 @@ std::string cores_check(const HeadShape& shape, const HeadLayout& lay, const RsP
     if (pbuf > cap) {
         return "the ports' logits sub-blocks: " + kb0(pbuf) + " KB > the arena's " + kb0(cap) + " KB";
     }
-    const uint32_t N = shape.N(), S = shape.S(), K = shape.K, EPC = shape.EPC(), A = shape.A;
-    if (N * EPC > 1024 || S > 2048 || EPC > 64 || S % 32) {
+    // (the planner and the exchange: the whole chunk's tokens - every token loop's)
+    const uint32_t N = shape.N(), S = shape.SA(), K = shape.K, EPC = shape.EPC(), A = shape.A;
+    if (N * EPC > 1024 || S > 2048 || EPC > 64 || shape.S() % 32) {
         return "routing planner: N EPC " + s(N * EPC) + " <= 1024, S " + s(S) + " <= 2048 tokens a chip, EPC " +
                s(EPC) + " <= 64";
     }
-    const int64_t rows_cap = routing_worst_rows(N, S, K, EPC);
-    RoutingSizes sz{};
-    int64_t step = 0, per = 0, pl0 = 0;
-    uint32_t M = std::min({2 * nc, EPC, A, 14u});
-    bool found = false;
-    for (; M > 0; --M) {
-        sz = routing_a2a_sizes(N, S, K, EPC, A, rows_cap, M);
-        step = al64(sz.plan_l1);
-        per = ceil_div(M, nc);
-        pl0 = per * step <= region_of(roff, "bias") ? 0 : al64(rbytes);
-        if (sz.fits && pl0 + per * step <= arena) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        const std::string what =
-            !sz.why.empty() ? sz.why : s(per) + " region(s) of " + kb0(step) + " KB past " + kb0(pl0) + " KB";
+    // (the last token loop's planner - or the only one's - over the router's dead buffers [0, bias) where it fits)
+    const auto pp = place_planner(N, S, K, EPC, A, nc, region_of(roff, "bias"), rbytes, arena);
+    const uint32_t M = pp.M;
+    if (!pp.ok) {
+        const int64_t per = ceil_div(std::max<uint32_t>(M, 1), nc);
+        const std::string what = !pp.sz.why.empty()
+                                     ? pp.sz.why
+                                     : s(per) + " region(s) of " + kb0(pp.step) + " KB past " + kb0(pp.pl0) + " KB";
         return "routing planner: " + what + " > the arena's " + kb0(arena) + " KB";
+    }
+    if (shape.loops > 1) {  // (an earlier loop's: M instances planning no token, past the router's bytes)
+        const auto idle = place_planner(N, kPlannerIdleS, K, EPC, A, nc, 0, rbytes, arena, M);
+        if (!idle.ok) {
+            return "routing planner: an earlier token loop's " + s(M) + " instances past the router's " + kb0(rbytes) +
+                   " KB > the arena's " + kb0(arena) + " KB";
+        }
     }
     const auto rt = routing_paths(shape.R, G, ring, shape.sp_ring && shape.R > 2, L);
     if (std::holds_alternative<std::string>(rt)) {
         return "routing exchange: " + std::get<std::string>(rt);
     }
-    const auto [nx, ny, nf, nsend] = std::get<RoutingPaths>(rt);
-    if (nf > 64) {
-        return "routing exchange: a port forwards " + s(nf) + " packets > 64";
+    const auto [nx, ny, nf_all, nsend] = std::get<RoutingPaths>(rt);
+    if (nf_all > 64) {
+        return "routing exchange: a port forwards " + s(nf_all) + " packets > 64";
     }
+    // (token loops: the forwarder's L1 scratch a ring of kFwdRing slots)
+    const uint32_t nf = shape.loops > 1 ? std::min(nf_all, kFwdRing) : nf_all;
     const int64_t pcap = routing_slot_bytes(S, K, EPC, M);
     const int64_t xg = port_cb_bytes(lay.KB, shape.payload, kPortGroup);  // (the x-gather's staging, after them)
     const int64_t port = al64(al64(pbuf) + int64_t(nx + nf) * pcap) + xg;
@@ -574,7 +574,7 @@ std::string shape_checks(const HeadShape& shape) {
         return "rows a mesh row " + s(shape.rows) + " must be a multiple of 32 x TP = " + s(32 * G) +
                "; nearest valid " + s(nxt);
     }
-    const uint32_t N = shape.N(), S = shape.S(), EPC = shape.EPC();
+    const uint32_t N = shape.N(), S = shape.SA(), EPC = shape.EPC();
     if (N > moe_block_plan_words::kMaxChips || shape.A > moe_block_plan_words::kAccMax) {
         return "routing planner: N " + s(N) + " <= 32 chips, accumulators " + s(shape.A) + " <= " +
                s(moe_block_plan_words::kAccMax);

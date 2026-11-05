@@ -163,8 +163,9 @@ void bind_fused_head(nb::module_& mod) {
                 in main's KV-pad-aware rotated layout over the SP rows (moe_padding_config): an SP row's real rows are
                 a prefix, TP chip p owns the row's tokens p S ... Padding tokens get no routes: not dispatched, not
                 computed by the routed experts, not combined (their combined rows are zero). None: every row is real.
-            loop: the sub-chunk this call runs when the chunk runs as MoEBlockConfig.token_loops sub-chunks (x: the
-                sub-chunk's rows of every chip; a padded chunk's real rows offset by it).
+            loop: this call's loop over the chunk when it runs as MoEBlockConfig.chunk_splits x token_loops head
+                calls (split x token_loops + its loop in the split; x: that call's rows of every chip). A split's
+                last loop plans every loop's tokens of the split.
 
         Returns:
             FusedHeadOutputs: se, rows, xbuf, route and the combine plan (counts, regions, token_index, table,

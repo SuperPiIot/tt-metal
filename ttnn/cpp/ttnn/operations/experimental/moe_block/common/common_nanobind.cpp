@@ -130,7 +130,9 @@ void bind_config(nb::module_& mod) {
         .def_rw("num_links", &MoEBlockConfig::num_links)
         .def_rw("chunk_tokens", &MoEBlockConfig::chunk_tokens)
         .def_rw("token_loops", &MoEBlockConfig::token_loops)
+        .def_rw("chunk_splits", &MoEBlockConfig::chunk_splits)
         .def_prop_ro("loop_tokens", &MoEBlockConfig::loop_tokens)
+        .def_prop_ro("split_tokens", &MoEBlockConfig::split_tokens)
         .def_rw("persist_l1_small", &MoEBlockConfig::persist_l1_small)
         .def_rw("words_slab_bytes", &MoEBlockConfig::words_slab_bytes)
         .def("check", &MoEBlockConfig::check);
@@ -192,8 +194,9 @@ void bind_resources(nb::module_& mod) {
             "set_token_loops",
             &MoEBlockResources::set_token_loops,
             nb::arg("token_loops"),
-            "Plan the ops for chunk_tokens / token_loops (MoEBlockConfig.token_loops): drops every plan and persistent "
-            "word made so far - before any op call or weight preparation on these resources")
+            nb::arg("chunk_splits") = 1,
+            "Plan the ops for MoEBlockConfig.token_loops / chunk_splits: drops every plan and persistent word made so "
+            "far - before any op call or weight preparation on these resources")
         .def("freeze", &MoEBlockResources::freeze)
         .def_prop_ro("frozen", &MoEBlockResources::frozen)
         .def("release", &MoEBlockResources::release);

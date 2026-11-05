@@ -46,22 +46,39 @@ FORCE_INLINE void rt_valid_issue(uint32_t l1) {
 FORCE_INLINE uint32_t rt_prefix_count(uint32_t end, uint32_t base, uint32_t len) {
     return end <= base ? 0 : (end - base < len ? end - base : len);
 }
-// this chip's real tokens: its SP row's real rows (moe_padding_config's closed form), less the rows before mine in
-// it, clamped to S
-FORCE_INLINE uint32_t rt_valid_local(uint32_t l1) {
+// my SP row's real rows (moe_padding_config's closed form)
+FORCE_INLINE uint32_t rt_valid_row(uint32_t l1) {
     const uint32_t start = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1);
     const uint32_t end = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1 + 64);
     const uint32_t my = get_common_arg_val<uint32_t>(4), sp = get_common_arg_val<uint32_t>(5);
-    const uint32_t tpc = get_common_arg_val<uint32_t>(6), first = get_common_arg_val<uint32_t>(7);
-    const uint32_t s = get_common_arg_val<uint32_t>(8);
+    const uint32_t tpc = get_common_arg_val<uint32_t>(6);
     const uint32_t chunk = sp * tpc, slab = start / chunk, bchip = (start / tpc) % sp, boff = start % tpc;
-    uint32_t row;
     if (my != bchip) {  // (one run: rows before the boundary row a slab on)
-        row = rt_prefix_count(end, ((my < bchip ? slab + 1 : slab) * chunk) + my * tpc, tpc);
-    } else {  // (the boundary row starts mid-slab and wraps into the next: two runs)
-        row = rt_prefix_count(end, slab * chunk + my * tpc + boff, tpc - boff) +
-              rt_prefix_count(end, (slab + 1) * chunk + my * tpc, boff);
+        return rt_prefix_count(end, ((my < bchip ? slab + 1 : slab) * chunk) + my * tpc, tpc);
     }
-    return row <= first ? 0 : (row - first < s ? row - first : s);
+    // (the boundary row starts mid-slab and wraps into the next: two runs)
+    return rt_prefix_count(end, slab * chunk + my * tpc + boff, tpc - boff) +
+           rt_prefix_count(end, (slab + 1) * chunk + my * tpc, boff);
+}
+// rows of the SP row's real prefix of `row` in [f, f + s)
+FORCE_INLINE uint32_t rt_clamp(uint32_t row, uint32_t f, uint32_t s) {
+    return row <= f ? 0 : (row - f < s ? row - f : s);
+}
+// this chip's real tokens of the call: its SP row's real rows, less the rows before mine in it ([7]: with token loops
+// the loop's first row plus p S), clamped to S
+FORCE_INLINE uint32_t rt_valid_local(uint32_t l1) {
+    return rt_clamp(rt_valid_row(l1), get_common_arg_val<uint32_t>(7), get_common_arg_val<uint32_t>(8));
+}
+// every token loop's real tokens of mine (the routing planner plans them all, in the last loop): loop i's are the SP
+// row's rows i sub + p S .., S of them ([9] sub, [10] loops, [11] p S) - a prefix of my owned tokens i S + t
+FORCE_INLINE uint32_t rt_valid_owned(uint32_t l1) {
+    const uint32_t row = rt_valid_row(l1), s = get_common_arg_val<uint32_t>(8);
+    const uint32_t sub = get_common_arg_val<uint32_t>(9), loops = get_common_arg_val<uint32_t>(10);
+    const uint32_t ps = get_common_arg_val<uint32_t>(11);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < loops; ++i) {
+        n += rt_clamp(row, i * sub + ps, s);
+    }
+    return n;
 }
 #endif

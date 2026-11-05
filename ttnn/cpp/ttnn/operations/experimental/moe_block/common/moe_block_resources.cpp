@@ -188,11 +188,12 @@ ttsl::hash::hash_t MoEBlockResources::make_plan_key() const {
 
 MoEBlockResources::~MoEBlockResources() { release(); }
 
-void MoEBlockResources::set_token_loops(uint32_t k) {
+void MoEBlockResources::set_token_loops(uint32_t k, uint32_t b) {
     check_alive();
     TT_FATAL(!frozen_, "moe_block: resources are frozen; set_token_loops before freeze()");
     MoEBlockConfig c = config_;
     c.token_loops = k;
+    c.chunk_splits = b;
     c.check();
     drop_state();
     config_ = c;

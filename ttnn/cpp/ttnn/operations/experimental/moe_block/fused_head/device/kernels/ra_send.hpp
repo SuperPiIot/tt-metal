@@ -172,6 +172,11 @@ struct RASend {
         done = 1;
     }
 };
+// RA_FWD_RING (token loops): the forwarder's L1 scratch slots, reused in turn once the slot's last packet left (else
+// one a packet)
+#ifndef RA_FWD_RING
+#define RA_FWD_RING RA_NF_
+#endif
 // a forwarding port's slots: each packet (of another chip, on its way) landed in its DRAM slot page with its flag set -
 // read into the scratch slot (L1, this program's) and sent on to its next hop (any order), the flag re-armed. args at
 // r0: n, scratch base, flags, PCAP, slot tensor, c0, c1, planner core 0 (x, y), mesh, the forward slots tensor, this
@@ -228,8 +233,11 @@ struct RAFwd {
                     continue;
                 }
                 DeviceZoneScopedN("SE-RAFWD");
-                const uint32_t pb = fb + k * PCAP;
+                const uint32_t pb = fb + (k % RA_FWD_RING) * PCAP;
                 {
+                    if constexpr (RA_FWD_RING < RA_NF_) {
+                        noc_async_writes_flushed();  // (the slot's last packet has left its L1)
+                    }
                     noc_async_read(TensorAccessor(ra_acc::fslots, fd, PCAP).get_noc_addr(pg0 + k), pb, PCAP);
                     noc_async_read_barrier();
                     invalidate_l1_cache();

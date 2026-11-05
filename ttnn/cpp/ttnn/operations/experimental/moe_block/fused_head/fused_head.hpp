@@ -105,8 +105,11 @@ struct FusedHeadSetup {
     HeadProgramConfig config;
     std::vector<uint32_t> words;  // the persistent words' addresses, head_words' order
     FusedHeadInputs inputs;       // the persistent tensors (a call sets x and the weights)
-    std::shared_ptr<HeadPatchStore> patches;
-    std::shared_ptr<HeadPatchStore> patches_padded;  // the padded chunk's programs (actual_start / end): their args
+    // token loops: the shared expert's output of each loop (loop 0's is inputs.y), kept for the tail's loop
+    std::vector<Tensor> y_loops;
+    // a token loop's programs (one each: the loop's offsets are args), unpadded / padded (actual_start / end)
+    std::vector<std::shared_ptr<HeadPatchStore>> patches;
+    std::vector<std::shared_ptr<HeadPatchStore>> patches_padded;
     mutable std::optional<Tensor> arena;  // the default arena (made on first use)
 };
 const FusedHeadSetup& setup_fused_head(

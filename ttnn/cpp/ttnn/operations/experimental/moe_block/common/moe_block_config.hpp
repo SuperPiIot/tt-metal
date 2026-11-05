@@ -90,13 +90,23 @@ struct MoEBlockConfig {
     // Geometry inputs that are not derived
     uint32_t num_links = 2;     // links per direction, the same on every axis
     uint32_t chunk_tokens = 0;  // the global chunk, all chips together
-    // The chunk's token loops: the block runs a chunk as token_loops sub-chunks of chunk_tokens / token_loops tokens,
-    // one after another, each op planned for the sub-chunk (a chunk whose L1 does not fit at once). 0: MoEBlock picks
-    // the fewest that plan (MoEBlockResources::set_token_loops); the ops take 0 as 1.
+    // The head's and the tail's token loops: each runs a chunk as token_loops calls of chunk_tokens / token_loops
+    // tokens (each chip's rows i chunk / (SP k) ..), while the dispatch, the routed experts and the combine run once on
+    // the whole chunk - every expert's weights read once. The head's routing planner plans every loop's tokens in its
+    // last call. 0: MoEBlock picks the fewest whose head fits (MoEBlockResources::set_token_loops); the ops take 0
+    // as 1.
     uint32_t token_loops = 0;
+    // The block's splits: the whole block (head, dispatch, experts + combine, tail) runs a chunk as chunk_splits
+    // pieces of chunk_tokens / chunk_splits tokens - each piece reads every expert's weights again; only where the
+    // dispatch / combine (or a looping head) of the whole chunk does not fit. Each piece runs token_loops head / tail
+    // calls. 0: MoEBlock picks (the fewest splits, then the fewest loops); the ops take 0 as 1.
+    uint32_t chunk_splits = 0;
     uint32_t loops() const { return token_loops == 0 ? 1u : token_loops; }
-    // the tokens the ops are planned for: one sub-chunk
-    uint32_t loop_tokens() const { return chunk_tokens / loops(); }
+    uint32_t splits() const { return chunk_splits == 0 ? 1u : chunk_splits; }
+    // the tokens the dispatch and the experts + combine are planned for: one split's
+    uint32_t split_tokens() const { return chunk_tokens / splits(); }
+    // the tokens a head / tail call is planned for: one loop's
+    uint32_t loop_tokens() const { return split_tokens() / loops(); }
 
     // Where the persistent words live
     bool persist_l1_small = false;  // in L1_SMALL (else L1)

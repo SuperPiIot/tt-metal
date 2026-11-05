@@ -71,7 +71,7 @@ Tensor sparse_dispatch_2d(
 uint32_t sparse_dispatch_2d_arena_bytes(MoEBlockResources& resources, uint32_t width, uint32_t dtype_bytes) {
     const auto& topo = resources.topology();
     const uint32_t N = topo.num_chips();
-    const uint32_t S = resources.config().loop_tokens() / N;
+    const uint32_t S = resources.config().split_tokens() / N;
     const uint32_t row_bytes = (width * dtype_bytes + 63u) / 64u * 64u;
     const uint32_t plan_bytes = (S * route_words(N) * 4u + 63u) / 64u * 64u;
     return cb_sizes(topo, S, row_bytes, plan_bytes, dispatch_group(resources), 16).arena_bytes();

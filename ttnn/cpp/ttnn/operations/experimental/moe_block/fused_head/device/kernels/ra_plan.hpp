@@ -96,11 +96,13 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
     // arrivals need the invalidations this kernel already does; off again before returning, for the firmware)
     set_l1_data_cache<true>();
 
+#ifndef RAP_SV0  // (an earlier token loop's planner plans no token: no rows to read)
     const auto rt = TensorAccessor(rt_args, rt_addr, PB);
     for (uint32_t pg = 0; pg < NPG; ++pg) {
         noc_async_read(rt.get_noc_addr(pg), B + O_RT + pg * PSZ, PB);
     }
-#ifdef RT_VALID
+#endif
+#if defined(RT_VALID) && !defined(RAP_SV0)
     // (a padded chunk's actual_start / actual_end, into O_WANT: local scratch of step 4 - nothing writes it before)
     const uint32_t vl1 = rt_valid_slot(B + O_WANT);
     static_assert(O_PIN - O_WANT >= 128, "the scalars' slots: 64 B aligned in O_WANT, 128 B");
@@ -116,8 +118,13 @@ FORCE_INLINE void plan(uint32_t a0, uint32_t B) {
     }
     noc_async_read_barrier();
     invalidate_l1_cache();
-#ifdef RT_VALID
-    const uint32_t SV = rt_valid_local(vl1);  // (my real tokens: 0 .. SV - 1; the rest are padding, unplanned)
+#ifdef RAP_SV0
+    // (token loops, an earlier loop: no token planned - the exchange runs empty, the chips' barrier between loops;
+    // the last loop plans every loop's tokens)
+    constexpr uint32_t SV = 0;
+#elif defined(RT_VALID)
+    // (my real tokens of every token loop: 0 .. SV - 1; the rest are padding, unplanned)
+    const uint32_t SV = rt_valid_owned(vl1);
 #else
     constexpr uint32_t SV = S;
 #endif

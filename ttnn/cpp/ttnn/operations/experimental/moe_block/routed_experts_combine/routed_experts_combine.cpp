@@ -106,7 +106,7 @@ CombineL1Plan plan_routed_experts_combine_l1(
     auto& mesh = res.mesh_device();
     const auto& cfg = res.config();
     const uint32_t N = res.topology().num_chips();
-    TT_FATAL(cfg.loop_tokens() % N == 0, "routed_experts_combine: chunk {} over {} chips", cfg.loop_tokens(), N);
+    TT_FATAL(cfg.split_tokens() % N == 0, "routed_experts_combine: chunk {} over {} chips", cfg.split_tokens(), N);
     // The flat expert as the caller gave it when its plan fits the arena the combine gets, else with that arena as
     // its budget (FlatLayoutOptions.arena_bytes: the flat plan fits it) - a smaller plan leaves the arena at least as
     // large, so the fitted plan still fits.
@@ -134,7 +134,7 @@ CombineL1Plan plan_routed_experts_combine_l1(
         (fp->arena_tiles * 2048) >> 10);
     out.cells = free_cells(res, *fp);
     CombinePlanInputs in;
-    in.S = cfg.loop_tokens() / N;
+    in.S = cfg.split_tokens() / N;
     in.W = res.dims().routed_width();
     in.cells = out.cells;
     in.n_acc = combine.n_acc;

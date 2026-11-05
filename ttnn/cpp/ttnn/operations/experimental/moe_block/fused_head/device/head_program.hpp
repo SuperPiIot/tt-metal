@@ -112,8 +112,8 @@ struct HeadBuffers {
     // address (0 when absent). Fixed arrays: a cache hit builds one a chip.
     std::array<tt::tt_metal::Buffer*, kHeadMaxSrc> buffers{};
     std::array<uint32_t, kHeadMaxSrc> addresses{};
-    // a padded chunk run as token loops (MoEBlockConfig.token_loops): the loops and this call's sub-chunk
-    uint32_t loops = 1, loop = 0;
+    // token loops (MoEBlockConfig.token_loops k): k, this call's loop of its split, its split (chunk_splits)
+    uint32_t loops = 1, loop = 0, split = 0;
     tt::tt_metal::Buffer* operator[](HeadSrc s) const { return buffers[s]; }
 };
 

@@ -57,6 +57,20 @@ a token with no rows. The shared expert still computes every row (its padding ro
 the scalars the programs are the unpadded ones; the padded programs keep their own address patches
 (`FusedHeadSetup.patches_padded`).
 
+## Token loops
+
+`MoEBlockConfig.token_loops` k (with `chunk_splits` b: the whole block per split): the head runs a split as k calls of
+its rows (`fused_head(..., loop=split k + i)`, each chip's rows `i r ..` of the split) and the dispatch, the routed
+experts and the combine run once on the split, so every expert's weights are read once. A call's routing rows, route
+words and dispatch rows land at its tokens' offset (`i S`) in the split's tensors; its shared expert output is its own
+tensor (the tail's loop i). An earlier loop's routing planner plans no token (`RAP_SV0`): the exchange still runs
+empty, the chips' barrier before the next loop writes into a peer's L1. The last loop's planner is sized for the
+split's `k S` tokens and overlays the router's dead buffers up to the bias (`router_layout(arr_first)`: the peers'
+logits arrivals included - dead once every router core's rows are written). A forwarding port's L1 scratch is then a
+ring of `kFwdRing` slots. A padded chunk's planner counts every loop's real tokens (`rt_valid_owned`: a prefix of the
+owned order `i S + t`). `MoEBlock` picks one call wherever the chunk fits, else the fewest splits, then the fewest
+loops.
+
 ## Host plan
 
 The planner returns a `HeadFit`: `ok`, the planned layouts (best first, each with its arena bytes, region sizes,
