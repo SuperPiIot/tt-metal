@@ -335,9 +335,10 @@ class TtK3MoEBlockFfn:
             n: fw.uninitialized_bank_sharded(*shapes[n], lay["banks"], ttnn.bfloat4_b, self.mesh)
             for n in ("w_gu", "w_d")
         }
-        cache = self.cache if self.cache is not None else _cache_dir(self.mesh)
         if sources is not None:
-            cache = "host weights"  # (the log's source label; device_sources is not called)
+            cache = "host weights"  # (the log's label: no TtMoe cache, no checkpoint looked up)
+        else:
+            cache = self.cache if self.cache is not None else _cache_dir(self.mesh)
         for n in dst:
             pages = (int(dst[n].shape[-2]) // 32) * (int(dst[n].shape[-1]) // 32)
             got = sum(int(sub[n][0].numel()) for _, _, sub in batches)
