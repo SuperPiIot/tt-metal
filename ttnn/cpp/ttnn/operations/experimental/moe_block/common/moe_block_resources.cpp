@@ -170,7 +170,11 @@ MoEBlockResources::MoEBlockResources(
         plan_.topo.num_chips());
     resources_detail::check_fabric_ties(mesh_device, plan_.topo);
     luts_ = moe_block::port_luts(plan_);
-    plan_key_ = ttsl::hash::hash_objects_with_default_seed(
+    plan_key_ = make_plan_key();
+}
+
+ttsl::hash::hash_t MoEBlockResources::make_plan_key() const {
+    return ttsl::hash::hash_objects_with_default_seed(
         config_,
         dims_,
         dtypes_,
@@ -183,6 +187,17 @@ MoEBlockResources::MoEBlockResources(
 }
 
 MoEBlockResources::~MoEBlockResources() { release(); }
+
+void MoEBlockResources::set_token_loops(uint32_t k) {
+    check_alive();
+    TT_FATAL(!frozen_, "moe_block: resources are frozen; set_token_loops before freeze()");
+    MoEBlockConfig c = config_;
+    c.token_loops = k;
+    c.check();
+    drop_state();
+    config_ = c;
+    plan_key_ = make_plan_key();
+}
 
 tt::tt_metal::distributed::MeshDevice& MoEBlockResources::mesh_device() const {
     check_alive();
@@ -312,6 +327,11 @@ void MoEBlockResources::release() {
     if (mesh_device_ == nullptr) {
         return;
     }
+    drop_state();
+    mesh_device_ = nullptr;
+}
+
+void MoEBlockResources::drop_state() {
     plans_.clear();
     for (auto& [name, t] : tensors_) {
         t.deallocate(true);  // (a packed words slot: a view - marks it released, frees nothing)
@@ -326,7 +346,6 @@ void MoEBlockResources::release() {
     words_slab_capacity_ = 0;
     words_slab_used_ = 0;
     ports_.clear();
-    mesh_device_ = nullptr;
 }
 
 void MoEBlockResources::check_not_frozen(const std::string& name) const {

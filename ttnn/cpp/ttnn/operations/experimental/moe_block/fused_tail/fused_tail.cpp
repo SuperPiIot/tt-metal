@@ -29,11 +29,11 @@ uint32_t tile_bytes(DataType dtype) {
     return dtype == DataType::BFLOAT8_B ? 1088 : 2048;
 }
 
-// A mesh row's tokens: chunk / SP when the config has a chunk, else from the owner rows.
+// A mesh row's tokens: the chunk (one token loop's) / SP when the config has a chunk, else from the owner rows.
 uint32_t rows_of(const MoEBlockResources& resources, std::optional<uint32_t> own_rows) {
     const auto& topo = resources.topology();
     if (resources.config().chunk_tokens != 0) {
-        return resources.config().chunk_tokens / topo.R;
+        return resources.config().loop_tokens() / topo.R;
     }
     TT_FATAL(own_rows.has_value(), "fused_tail: MoEBlockConfig.chunk_tokens is not set");
     return *own_rows * topo.C;

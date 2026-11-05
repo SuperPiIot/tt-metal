@@ -54,7 +54,7 @@ HeadShape head_shape_of(
     tt::tt_metal::DataType shared_weights) {
     using tt::tt_metal::DataType;
     HeadShape s;
-    s.rows = config.chunk_tokens / topology.R;
+    s.rows = config.loop_tokens() / topology.R;
     s.H = dims.emb_dim;
     s.I = dims.shared_expert_hidden_dim.value_or(0) / topology.C;
     s.G = topology.C;
@@ -316,8 +316,11 @@ FusedHeadOutputs fused_head(
     std::optional<int64_t> l1_free,
     const std::optional<Tensor>& arena,
     const std::optional<Tensor>& actual_start,
-    const std::optional<Tensor>& actual_end) {
+    const std::optional<Tensor>& actual_end,
+    uint32_t loop) {
     using namespace fused_head_entry_detail;
+    const uint32_t loops = resources.config().loops();
+    TT_FATAL(loop < loops, "fused_head: loop {} of {} token loops", loop, loops);
     const auto& setup = setup_fused_head(resources, dtypes, accumulators, l1_free);
     FusedHeadParams params{
         .config = setup.config,
@@ -325,7 +328,9 @@ FusedHeadOutputs fused_head(
         .model = setup.model,
         .words = setup.words,
         .arena = arena ? *arena : default_arena(resources, setup),
-        .patches = actual_start ? setup.patches_padded : setup.patches};
+        .patches = actual_start ? setup.patches_padded : setup.patches,
+        .loops = loops,
+        .loop = loop};
     auto in = call_inputs(setup, x, weights, x_full);
     in.actual_start = actual_start;
     in.actual_end = actual_end;

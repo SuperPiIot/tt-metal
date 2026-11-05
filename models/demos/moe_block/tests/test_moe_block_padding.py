@@ -14,7 +14,9 @@ token's embedding, so all of them pick the same experts). With (actual_start, ac
   * the padding tokens' combined rows are zero - exactly the host model's padding rows, so every chip's real count is
     the model's - and the routing planner counted no row for them (each expert's count = the real tokens' picks);
   * traced: one capture replayed with other (start, end) (device words) matches the eager forward.
-Each runs twice: the planner's head, and the head with router iterations forced (head_router_iterations 2).
+Each runs three times: the planner's head, the head with router iterations forced (head_router_iterations 2), and the
+chunk as two token loops (MoEBlockConfig.token_loops 2: two sub-chunks, each chip's rows halved - skipped where a
+sub-chunk's rows a mesh row are not a multiple of 32 x TP, e.g. chunk 1280; MOE_PAD_CHUNK=2560 runs it).
 
 MOE_PAD_CHUNK: the chunk (1280; 2560 fits too, 5120 not on the LoudBox's grid).
 test_padding_perf (TT_METAL_DEVICE_PROFILER=1, TT_METAL_PROFILER_MID_RUN_DUMP=1, TT_METAL_PROFILER_CPP_POST_PROCESS=1):
@@ -48,11 +50,15 @@ def _fw():
 
 
 class _Capture:
-    """block.mb with fused_tail's routed input (the combine's y_own) and the head's outputs kept."""
+    """block.mb with fused_tail's routed input (the combine's y_own) kept; with record set (eager forwards), each
+    sub-chunk's combine output and the head's routing rows and counts read back at its tail (one a token loop)."""
 
     def __init__(self, inner):
         self._inner = inner
         self.y_own = None
+        self.block = None
+        self.record = False
+        self.loops = []
 
     def __getattr__(self, k):
         f = getattr(self._inner, k)
@@ -61,6 +67,10 @@ class _Capture:
 
         def tail(y_own, *a, **kw):
             self.y_own = y_own
+            if self.record:
+                h = self.block.last_head
+                host = lambda t: [ttnn.to_torch(d) for d in ttnn.get_device_tensors(t)]  # noqa: E731
+                self.loops.append(dict(y_own=host(y_own), rows=host(h.rows), counts=host(h.counts)))
             return f(y_own, *a, **kw)
 
         return tail
@@ -81,8 +91,12 @@ def mesh():
 
 # 0: the planner's head (the router stage in one go here); 2: forced router iterations (the router stage once a group of
 # row chunks, as the planner picks where the one-go router doesn't fit, e.g. Kimi-K3 at chunk >= 4096 on a 4x4 stage)
-@pytest.fixture(scope="module", params=[0, 2], ids=["router_once", "router_iters"])
+# loops2: the chunk as two token loops (the planner's head on each sub-chunk)
+@pytest.fixture(scope="module", params=[(0, 0), (2, 0), (0, 2)], ids=["router_once", "router_iters", "loops2"])
 def setup(mesh, request):
+    router_iters, loops = request.param
+    if loops and (CHUNK // loops // R) % (32 * C):
+        pytest.skip(f"chunk {CHUNK} as {loops} token loops: a sub-chunk's rows a mesh row not a multiple of {32 * C}")
     mb = ttnn.experimental.moe_block
     fw = _fw()
     act = mb.ExpertActivation(kind=mb.ExpertActivationKind.ClampedSilu, limit=10.0)
@@ -95,7 +109,8 @@ def setup(mesh, request):
     dtypes = mb.MoEDtypes()
     cfg = mb.MoEBlockConfig(chunk_tokens=CHUNK, num_links=2, persist_l1_small=True)
     cfg.combine_snap = SNAP
-    cfg.head_router_iterations = request.param
+    cfg.head_router_iterations = router_iters
+    cfg.token_loops = loops
     res = mb.MoEBlockResources(mesh, dims, cfg, dtypes)
     block = MoEBlock(mesh, res, dtypes=dtypes, activation=fw.ACTS["silu"])  # (the planner's accumulators)
     g = torch.Generator().manual_seed(3)
@@ -122,11 +137,13 @@ def setup(mesh, request):
     weights = MoEBlockWeights(head=head_w, expert_ids=experts.gidx, gate_up=experts.w_gu, down=experts.w_d)
     base = torch.randn(CHUNK, H, generator=g).to(torch.bfloat16)  # (distinct rows everywhere)
     pad_row = torch.randn(1, H, generator=g).to(torch.bfloat16)
+    assert block.loops == max(loops, 1), f"token loops {block.loops}"
     cap = _Capture(block.mb)
+    cap.block = block
     block.mb = cap
     yield dict(
         mesh=mesh, mb=mb, block=block, weights=weights, base=base, pad_row=pad_row, cap=cap, EPC=EPC, N=N,
-        distinct=distinct, router_iters=request.param,
+        distinct=distinct, router_iters=router_iters, loops=block.loops,
     )  # fmt: skip
     experts.close()
     res.release()
@@ -220,6 +237,24 @@ def _owner_rows(t):
     return torch.cat([ttnn.to_torch(d).reshape(-1, d.shape[-1]) for d in ttnn.get_device_tensors(t)], dim=0)
 
 
+def _loops_rows(per_loop, width, take=None):
+    """each token loop's per-chip owner rows (row-major chips, [.., S/k, width] each) -> [CHUNK, width] in the chunk's
+    token order: chip (r, p)'s rows of loop i are SP row r's rows i CHUNK/(R k) + p S/k .."""
+    k = len(per_loop)
+    tpc, sub = CHUNK // R, CHUNK // R // k
+    Sk = sub // C
+    out = None
+    for i, chips in enumerate(per_loop):
+        for n, d in enumerate(chips):
+            rows = d.reshape(-1, d.shape[-1])[:Sk, : (take or d.shape[-1])]
+            if out is None:
+                out = torch.zeros(CHUNK, rows.shape[-1], dtype=rows.dtype)
+            r, p = divmod(n, C)
+            base = r * tpc + i * sub + p * Sk
+            out[base : base + Sk] = rows
+    return out
+
+
 def _residual(mesh, t):
     """the block's output [1, 1, S/SP, H/TP] a chip -> [CHUNK, H]"""
     return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMesh2dToTensor(mesh, mesh_shape=(R, C), dims=(2, 3))).reshape(
@@ -228,20 +263,23 @@ def _residual(mesh, t):
 
 
 def _counts(s):
-    """each chip's experts' counts from the planner (counts [.., NG] a chip: its EPC experts) -> [E]"""
-    EPC, out = s["EPC"], []
-    for i, d in enumerate(ttnn.get_device_tensors(s["block"].last_head.counts)):
-        out.append(ttnn.to_torch(d).reshape(-1)[i * EPC : (i + 1) * EPC].to(torch.int64))
-    return torch.cat(out)
+    """each chip's experts' counts from the planner (counts [.., NG] a chip: its EPC experts), summed over the token
+    loops -> [E]"""
+    EPC, total = s["EPC"], 0
+    for lp in s["cap"].loops:
+        out = [d.reshape(-1)[i * EPC : (i + 1) * EPC].to(torch.int64) for i, d in enumerate(lp["counts"])]
+        total = total + torch.cat(out)
+    return total
+
+
+def _rows_words(s):
+    """the routing rows [CHUNK, 2K] int64 (chunk order): a token's K ids, then K bf16 weights"""
+    return _loops_rows([[d.reshape(-1, 2 * K).to(torch.int64) for d in lp["rows"]] for lp in s["cap"].loops], 2 * K)
 
 
 def _picks(s):
     """the routing rows' expert ids [CHUNK, K] (chunk order) - every token's, padding included"""
-    out = []
-    for d in ttnn.get_device_tensors(s["block"].last_head.rows):
-        r = ttnn.to_torch(d).reshape(-1, 2 * K).to(torch.int64) & 0xFFFF  # (a token: K ids, then K bf16 weights)
-        out.append(r[: CHUNK // (R * C), :K])
-    return torch.cat(out)
+    return _rows_words(s)[:, :K] & 0xFFFF
 
 
 def _clobber(s):
@@ -273,12 +311,17 @@ def _span_kw(block, span):
 
 
 def _forward(s, rows, span=None):
-    mesh, block = s["mesh"], s["block"]
+    mesh, block, cap = s["mesh"], s["block"], s["cap"]
     _clobber(s)
     x = _x(mesh, rows)
-    y = block(x, s["weights"], **_span_kw(block, span))
+    cap.loops, cap.record = [], True
+    try:
+        y = block(x, s["weights"], **_span_kw(block, span))
+    finally:
+        cap.record = False
     ttnn.synchronize_device(mesh)
-    out = dict(y_own=_owner_rows(s["cap"].y_own), out=_residual(mesh, y), counts=_counts(s), picks=_picks(s))
+    y_own = _loops_rows([lp["y_own"] for lp in cap.loops], None)
+    out = dict(y_own=y_own, out=_residual(mesh, y), counts=_counts(s), picks=_picks(s), words=_rows_words(s))
     ttnn.deallocate(y)
     ttnn.deallocate(x)
     return out
@@ -303,19 +346,15 @@ def test_unpadded_reference(setup):
     assert _same(o["y_own"], o2["y_own"]) and _same(o["out"], o2["out"]), "not deterministic"
 
 
-def _routes(s):
-    """the routing rows [CHUNK, K] expert ids and [CHUNK, K] gate weights (chunk order)"""
-    ids, ws = [], []
-    for d in ttnn.get_device_tensors(s["block"].last_head.rows):
-        r = ttnn.to_torch(d).reshape(-1, 2 * K).to(torch.int64)[: CHUNK // (R * C)]
-        ids.append(r[:, :K] & 0xFFFF)
-        ws.append(((r[:, K:] & 0xFFFF) << 16).to(torch.int32).view(torch.float32))
-    return torch.cat(ids), torch.cat(ws)
+def _routes(o):
+    """the routing rows [CHUNK, K] expert ids and [CHUNK, K] gate weights (chunk order) of a forward"""
+    r = o["words"]
+    return r[:, :K] & 0xFFFF, ((r[:, K:] & 0xFFFF) << 16).to(torch.int32).view(torch.float32)
 
 
-def _torch_y_own(s, rows, tokens):
-    """the routed experts' combined output of `tokens` in torch (fp32, the device's routes and gate weights)"""
-    ids, ws = _routes(s)
+def _torch_y_own(s, o, rows, tokens):
+    """the routed experts' combined output of `tokens` in torch (fp32, forward o's routes and gate weights)"""
+    ids, ws = _routes(o)
     out = []
     for t in tokens:
         x = rows[t].float()
@@ -351,7 +390,7 @@ def test_padded(setup):
     # (the real rows against torch: a sample of real tokens' routed output, the device's routes and gate weights)
     real = torch.nonzero(real_mask(*span)).reshape(-1)
     sample = real[torch.randperm(len(real), generator=torch.Generator().manual_seed(1))[:32]].tolist()
-    pcc = _pcc(o["y_own"][sample].float(), _torch_y_own(s, _padded(s, real_mask(*span)), sample))
+    pcc = _pcc(o["y_own"][sample].float(), _torch_y_own(s, o, _padded(s, real_mask(*span)), sample))
     assert pcc > 0.97, f"{span}: real tokens' routed output vs torch, PCC {pcc:.5f}"
     hot = torch.bincount(o["picks"][~real_mask(*span)].reshape(-1), minlength=E)
     logger.info(f"MOE_PAD (a) {span}: 32 real tokens' routed output vs torch PCC {pcc:.5f}")
@@ -372,9 +411,12 @@ def test_padded(setup):
                            mesh_mapper=ttnn.ReplicateTensorToMesh(s["mesh"]))  # fmt: skip
     _clobber(s)
     x = _x(s["mesh"], _padded(s, real_mask(*span)))
+    s["cap"].loops, s["cap"].record = [], True
     y = s["block"](x, s["weights"], metadata=(slot, st, en))
+    s["cap"].record = False
     ttnn.synchronize_device(s["mesh"])
-    o = dict(y_own=_owner_rows(s["cap"].y_own), out=_residual(s["mesh"], y), counts=_counts(s), picks=_picks(s))
+    y_own = _loops_rows([lp["y_own"] for lp in s["cap"].loops], None)
+    o = dict(y_own=y_own, out=_residual(s["mesh"], y), counts=_counts(s), picks=_picks(s))
     _check_padded(s, ref, o, span)
     logger.info("MOE_PAD metadata=(slot_id, actual_start, actual_end): ok")
 
@@ -398,10 +440,15 @@ def test_padded_traced(setup):
             block.chunk_scalars(*span)  # (the same two words the capture reads)
             _clobber(s)
             ttnn.execute_trace(mesh, tid, cq_id=0, blocking=True)
-            o = dict(y_own=_owner_rows(y_own), out=_residual(mesh, y), counts=_counts(s), picks=_picks(s))
-            _check_padded(s, ref, o, span)
+            out = _residual(mesh, y)
+            if s["loops"] == 1:
+                yo = _owner_rows(y_own)
             e = _forward(s, _padded(s, real_mask(*span)), span)
-            assert _same(o["y_own"], e["y_own"]) and _same(o["out"], e["out"]), f"{span}: traced vs eager"
+            if s["loops"] == 1:  # (token loops: the persistent y_own holds the last sub-chunk's; the output checks)
+                assert _same(yo, e["y_own"]), f"{span}: traced vs eager y_own"
+            m = real_mask(*span)
+            assert _same(out[m], ref["out"][m]), f"{span}: traced, the real tokens' block output differs"
+            assert _same(out, e["out"]), f"{span}: traced vs eager"
         logger.info(f"MOE_PAD (d) traced: one capture replayed with (start, end) {spans} = eager, ok")
     finally:
         ttnn.release_trace(mesh, tid)
@@ -448,7 +495,7 @@ def _device_us(s, rows, span, calls=15):
 def test_padding_perf(setup):
     if os.environ.get("TT_METAL_DEVICE_PROFILER") != "1":
         pytest.skip("needs TT_METAL_DEVICE_PROFILER=1 (+ MID_RUN_DUMP, CPP_POST_PROCESS)")
-    if setup["router_iters"]:
+    if setup["router_iters"] or setup["loops"] > 1:
         pytest.skip("perf of the planner's head only")
     s = setup
     names = ["head", "dispatch", "experts+combine", "tail"]

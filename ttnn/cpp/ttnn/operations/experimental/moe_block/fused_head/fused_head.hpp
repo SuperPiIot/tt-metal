@@ -123,7 +123,9 @@ const FusedHeadSetup& setup_fused_head(
 // read on device each call (traceable: replays take the values of the moment). The chunk is in main's KV-pad-aware
 // rotated layout over the SP rows (moe_padding_config): a row's real rows are a prefix, TP chip p owns its rows
 // p S ..; padding tokens get no routes, so the dispatch, the routed experts and the combine never see them (their
-// combined rows are zero). Absent: every row is real (the programs are the unpadded ones).
+// combined rows are zero). Absent: every row is real (the programs are the unpadded ones). loop: the sub-chunk this
+// call runs when the chunk is run as MoEBlockConfig.token_loops sub-chunks (x: the sub-chunk's rows; a padded chunk's
+// real rows offset by it).
 FusedHeadOutputs fused_head(
     const Tensor& x,
     const FusedHeadWeights& weights,
@@ -134,6 +136,7 @@ FusedHeadOutputs fused_head(
     std::optional<int64_t> l1_free = std::nullopt,
     const std::optional<Tensor>& arena = std::nullopt,
     const std::optional<Tensor>& actual_start = std::nullopt,
-    const std::optional<Tensor>& actual_end = std::nullopt);
+    const std::optional<Tensor>& actual_end = std::nullopt,
+    uint32_t loop = 0);
 
 }  // namespace ttnn::operations::experimental::moe_block::fused_head

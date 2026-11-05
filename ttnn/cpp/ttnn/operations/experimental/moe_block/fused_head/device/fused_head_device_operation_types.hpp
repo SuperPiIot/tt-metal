@@ -41,6 +41,9 @@ struct FusedHeadParams {
     std::vector<uint32_t> words;
     Tensor arena{};
     std::shared_ptr<HeadPatchStore> patches;
+    // MoEBlockConfig.token_loops and this call's sub-chunk: a padded chunk's programs bound each sub-chunk's real rows
+    // (one cached program a sub-chunk; an unpadded chunk's programs are the same for every sub-chunk)
+    uint32_t loops = 1, loop = 0;
 
     static constexpr auto attribute_names = std::forward_as_tuple("plan_key");
     auto attribute_values() const { return std::forward_as_tuple(plan_key); }

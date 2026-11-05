@@ -163,6 +163,8 @@ void bind_fused_head(nb::module_& mod) {
                 in main's KV-pad-aware rotated layout over the SP rows (moe_padding_config): an SP row's real rows are
                 a prefix, TP chip p owns the row's tokens p S ... Padding tokens get no routes: not dispatched, not
                 computed by the routed experts, not combined (their combined rows are zero). None: every row is real.
+            loop: the sub-chunk this call runs when the chunk runs as MoEBlockConfig.token_loops sub-chunks (x: the
+                sub-chunk's rows of every chip; a padded chunk's real rows offset by it).
 
         Returns:
             FusedHeadOutputs: se, rows, xbuf, route and the combine plan (counts, regions, token_index, table,
@@ -182,7 +184,8 @@ void bind_fused_head(nb::module_& mod) {
         nb::arg("l1_free") = nb::none(),
         nb::arg("arena") = nb::none(),
         nb::arg("actual_start") = nb::none(),
-        nb::arg("actual_end") = nb::none());
+        nb::arg("actual_end") = nb::none(),
+        nb::arg("loop") = 0);
 }
 
 }  // namespace ttnn::operations::experimental::moe_block::fused_head

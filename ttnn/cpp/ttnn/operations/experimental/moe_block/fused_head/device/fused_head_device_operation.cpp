@@ -54,7 +54,8 @@ ttsl::hash::hash_t FusedHeadDeviceOperation::compute_program_hash(
         args.x.tensor_spec(),
         args.w.tensor_spec(),
         args.w_router.tensor_spec(),
-        args.actual_start.has_value());
+        args.actual_start.has_value(),
+        args.actual_start.has_value() ? attrs.loop : 0u);
 }
 
 FusedHeadDeviceOperation::program_factory_t FusedHeadDeviceOperation::select_program_factory(
@@ -160,6 +161,8 @@ HeadBuffers head_buffers(const FusedHeadParams& attrs, const FusedHeadInputs& a)
     for (size_t i = 0; i < attrs.words.size(); ++i) {
         b.addresses[SRC_WORD0 + i] = attrs.words[i];
     }
+    b.loops = attrs.loops;
+    b.loop = attrs.loop;
     return b;
 }
 

@@ -43,7 +43,13 @@ class MoEBlock:
     SE_ACT);
     ``layout`` / ``combine``: FlatLayoutOptions / CombineConfig (combine.n_acc is set to ``accumulators``).
     Capacity and layout default to max(chunk, 256) and FlatLayoutOptions() - the combine fits the flat plan into its
-    arena (the largest free L1 block less the static CBs below it; FlatLayoutOptions.arena_bytes)."""
+    arena (the largest free L1 block less the static CBs below it; FlatLayoutOptions.arena_bytes).
+
+    Token loops (MoEBlockConfig.token_loops): a chunk whose L1 does not fit at once runs as k sub-chunks of chunk / k
+    tokens, the four ops once each a sub-chunk (each chip's rows i chunk / (SP k) ..; the block is per token, so the
+    output is the same). 0 (the default): the fewest loops whose plan fits, a resident head preferred to the head's DRAM
+    fallback - 1 wherever the chunk fits as it is. The resources are set for it here (set_token_loops), so prepare the
+    weights after the block is made (resources / accumulators / expert_kw); capacity is clamped to a sub-chunk."""
 
     def __init__(
         self,
@@ -65,14 +71,35 @@ class MoEBlock:
         assert resources.config.persist_l1_small, "MoEBlock: create its resources with persist_l1_small=True"
         self.mb, self.mesh_device, self.resources, self.dtypes = mb, mesh_device, resources, dtypes
         self.l1_free = l1_free
-        chunk = resources.config.chunk_tokens
-        if max_tokens_per_expert is None:  # (an expert sees each token at most once; the flat op is built for >= 256)
-            max_tokens_per_expert = max(chunk, 256)
         if layout is None:
             layout = mb.FlatLayoutOptions()
         self.combine = combine if combine is not None else mb.CombineConfig()
+        n_acc = self.combine.n_acc
+        ask = (accumulators, max_tokens_per_expert, activation, layout)
+        if resources.config.token_loops != 0:  # (the caller's loops)
+            self._plan(*ask, n_acc)
+        else:
+            self._plan_loops(ask, n_acc)
+        self.loops = max(1, int(resources.config.token_loops))
+        logger.info(
+            f"MoEBlock: accumulators {self.accumulators}, dispatch group {self.plan.l1.dispatch_group} ({self.plan.note})"
+            + (f", {self.loops} token loops of {resources.config.loop_tokens} tokens" if self.loops > 1 else "")
+        )
+        self.exchange_spec = (
+            None  # (the dispatch + combine's arena when the head's does not fit: the first call sets it)
+        )
+        self.one_arena = None
+        self.chunk_words = None  # (a padded chunk's scalars given as ints: two persistent device words, rewritten)
+
+    def _plan(self, accumulators, max_tokens_per_expert, activation, layout, n_acc):
+        """The block's plans for the resources' token loops (raises where one does not fit)."""
+        mb, resources, dtypes, l1_free = self.mb, self.resources, self.dtypes, self.l1_free
+        tokens = resources.config.loop_tokens
+        # (an expert sees each token of a sub-chunk at most once; the flat op is built for >= 256)
+        cap = max(tokens, 256)
+        self.combine.n_acc = n_acc
         self.expert_kw = dict(
-            max_tokens_per_expert=max_tokens_per_expert,
+            max_tokens_per_expert=cap if max_tokens_per_expert is None else min(max_tokens_per_expert, cap),
             activation=activation,
             layout=layout,
             combine=self.combine,
@@ -84,22 +111,39 @@ class MoEBlock:
         )
         self.accumulators = self.plan.accumulators
         self.combine.n_acc = self.accumulators
-        logger.info(
-            f"MoEBlock: accumulators {self.accumulators}, dispatch group {self.plan.l1.dispatch_group} ({self.plan.note})"
-        )
         # (plans the head and the combine once; every forward allocates this spec at the same L1 address)
         self.arena_spec = mb.moe_block_arena_spec(
             resources, dtypes=dtypes, accumulators=self.accumulators, l1_free=l1_free, **self.expert_kw
         )
-        self.exchange_spec = (
-            None  # (the dispatch + combine's arena when the head's does not fit: the first call sets it)
-        )
-        self.one_arena = None
-        self.chunk_words = None  # (a padded chunk's scalars given as ints: two persistent device words, rewritten)
         # (the head planner's DRAM fallback - a shape whose resident layouts do not fit the head's L1: x gathered over
         # TP into DRAM ahead of the head, which reloads it a row chunk at a time; the plan the op runs, same l1_free)
         fit = mb.plan_fused_head(resources, dtypes, self.accumulators, l1_free)
         self.x_dram = bool(fit.ok and len(fit.planned) and fit.planned[0].lay.xdram)
+
+    def _plan_loops(self, ask, n_acc):
+        """The fewest token loops whose plan fits, a resident head before the DRAM fallback (resources.token_loops 0)."""
+        resources = self.resources
+        chunk, sp = resources.config.chunk_tokens, resources.topology["R"]
+        # (each chip's sub-chunk rows a whole number of tiles: x is sliced by rows)
+        ks = [k for k in range(1, 65) if chunk % (k * sp * 32) == 0] or [1]
+        first_error, fallback = None, None
+        for k in ks:
+            if k > 1:
+                resources.set_token_loops(k)
+            try:
+                self._plan(*ask, n_acc)
+            except RuntimeError as ex:
+                first_error = first_error or ex
+                logger.info(f"MoEBlock: chunk {chunk} as {k} token loop(s) does not fit: {_short(ex)}")
+                continue
+            if not self.x_dram:
+                return
+            fallback = fallback or k  # (the head's DRAM fallback fits: kept unless more loops fit resident)
+            logger.info(f"MoEBlock: chunk {chunk} as {k} token loop(s): the head takes its DRAM fallback")
+        if fallback is None:
+            raise first_error
+        resources.set_token_loops(fallback)
+        self._plan(*ask, n_acc)
 
     def _one_arena_fits(self) -> bool:
         """One arena of the head's size a forward when it sits above the block's own programs' static circular buffers
@@ -170,7 +214,6 @@ class MoEBlock:
         end - start tokens real). Padding tokens are not routed, dispatched, computed by the routed experts or combined;
         their rows of the output are the shared expert's only (the dense parts still compute them; discard them).
         None: every row is real."""
-        mb = self.mb
         if metadata is not None:
             assert actual_start is None and actual_end is None, "MoEBlock: metadata or actual_start / actual_end"
             actual_start, actual_end = metadata[1], metadata[2]
@@ -180,6 +223,26 @@ class MoEBlock:
             actual_start, actual_end = self.chunk_scalars(actual_start, actual_end)
         if self.exchange_spec is None:  # (the first call, before any arena: one arena or two)
             self.one_arena = self._one_arena_fits()
+        if self.loops == 1:
+            return self._forward(x, weights, actual_start, actual_end)
+        # (token loops: each chip's rows i r .. (i + 1) r a sub-chunk, its output rows the same)
+        rows, width = int(x.shape[-2]), int(x.shape[-1])
+        r = rows // self.loops
+        outs = []
+        for i in range(self.loops):
+            xi = ttnn.slice(
+                x, [0, 0, i * r, 0], [1, 1, (i + 1) * r, width], [1, 1, 1, 1], memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            outs.append(self._forward(xi, weights, actual_start, actual_end, loop=i))
+            ttnn.deallocate(xi)
+        y = ttnn.concat(outs, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        for t in outs:
+            ttnn.deallocate(t)
+        return y
+
+    def _forward(self, x, weights, actual_start, actual_end, loop: int = 0) -> ttnn.Tensor:
+        """One sub-chunk (all of the chunk without token loops): head -> dispatch -> experts + combine -> tail."""
+        mb = self.mb
         # (the DRAM fallback's x_full [1, 1, rows, H]: this mesh row's x gathered over the TP axis)
         x_full = (
             ttnn.all_gather(x, dim=3, cluster_axis=1, memory_config=ttnn.DRAM_MEMORY_CONFIG) if self.x_dram else None
@@ -197,6 +260,7 @@ class MoEBlock:
             arena=arena,
             actual_start=actual_start,
             actual_end=actual_end,
+            **({"loop": loop} if self.loops > 1 else {}),
         )
         if x_full is not None:
             ttnn.deallocate(x_full)
@@ -232,6 +296,12 @@ class MoEBlock:
         )
         ttnn.deallocate(arena)
         return mb.fused_tail(y_own, head.se, resources=self.resources, w_up=weights.w_up)
+
+
+def _short(ex) -> str:
+    """a TT_FATAL's message without its backtrace"""
+    msg = " ".join(str(ex).split())
+    return msg.split(" backtrace:")[0][-300:]
 
 
 def l1_small_bytes(mesh_device) -> int:

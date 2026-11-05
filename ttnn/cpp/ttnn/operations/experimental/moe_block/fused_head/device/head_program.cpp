@@ -2501,12 +2501,21 @@ std::vector<KernelDescriptor> ChipProgram::router(std::vector<CBDescriptor>& cbs
     // a padded chunk (router_addr.hpp RT_VALID): the planners and the route words' writer read actual_start /
     // actual_end (common [2], [3]) and bound this chip's tokens by its SP row's real rows (main's rotated layout: [4]
     // the SP row r, [5] SP rows, [6] tokens a row) less the row's tokens before mine ([7] p S, my owned block p), [8]
-    // S; absent, the programs are the unpadded ones
+    // S; absent, the programs are the unpadded ones. Token loops: the row holds loops sub-chunks of S C tokens one
+    // after another, this call's the loop-th - [6] the whole row's tokens, [7] the sub-chunk's first row in it plus p S
     const bool padded = bufs[SRC_START] != nullptr;
     Args common_v = common;
     if (padded) {
+        const uint32_t sub = h.S * h.C;
         add(common_v,
-            Args{S(SRC_START), S(SRC_END), Arg(coord.first), Arg(h.R), Arg(h.S * h.C), Arg(p * h.S), Arg(h.S)});
+            Args{
+                S(SRC_START),
+                S(SRC_END),
+                Arg(coord.first),
+                Arg(h.R),
+                Arg(sub * bufs.loops),
+                Arg(bufs.loop * sub + p * h.S),
+                Arg(h.S)});
     }
     auto iter_defs = [&](KernelDescriptor& k) {  // (router iterations: RT_NIT of them, RT_RBI router cores)
         if (h.NIT > 1) {

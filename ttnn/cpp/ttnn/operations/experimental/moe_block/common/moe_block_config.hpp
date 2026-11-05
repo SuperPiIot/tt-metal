@@ -90,6 +90,13 @@ struct MoEBlockConfig {
     // Geometry inputs that are not derived
     uint32_t num_links = 2;     // links per direction, the same on every axis
     uint32_t chunk_tokens = 0;  // the global chunk, all chips together
+    // The chunk's token loops: the block runs a chunk as token_loops sub-chunks of chunk_tokens / token_loops tokens,
+    // one after another, each op planned for the sub-chunk (a chunk whose L1 does not fit at once). 0: MoEBlock picks
+    // the fewest that plan (MoEBlockResources::set_token_loops); the ops take 0 as 1.
+    uint32_t token_loops = 0;
+    uint32_t loops() const { return token_loops == 0 ? 1u : token_loops; }
+    // the tokens the ops are planned for: one sub-chunk
+    uint32_t loop_tokens() const { return chunk_tokens / loops(); }
 
     // Where the persistent words live
     bool persist_l1_small = false;  // in L1_SMALL (else L1)
