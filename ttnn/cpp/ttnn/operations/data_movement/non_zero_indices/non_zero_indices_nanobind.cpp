@@ -40,9 +40,7 @@ void bind_non_zero(nb::module_& mod) {
                * - BFLOAT16, FLOAT32, INT32, UINT32
                  - TILE, ROW_MAJOR
 
-            ``BFLOAT8_B`` and ``BFLOAT4_B`` are not supported: they are not rejected, but the returned indices are
-            wrong. The op runs on a single core, so the input volume is
-            limited by the L1 size of one core.
+            The op runs on a single core, so the input volume is limited by the L1 size of one core.
 
         Memory Support:
             - Input: interleaved DRAM and L1; HEIGHT_SHARDED, WIDTH_SHARDED and BLOCK_SHARDED in L1. A ROW_MAJOR input must not have shape padding, so a WIDTH_SHARDED or BLOCK_SHARDED ROW_MAJOR input needs a shard width that divides the last dimension
