@@ -34,6 +34,8 @@ def test_credit_policy():
     config's credit_batch wins."""
     assert mb.combine_credit_policy() == (8, 8, 8100)
     assert mb.combine_credit_policy(N=32, D=2) == (8, 8, 8100)
+    assert mb.combine_credit_policy(N=16, D=2) == (8, 8, 8100)  # (a Galaxy 4x4 sub-torus: 15 sources)
+    assert mb.combine_credit_policy(N=16, D=2, shared=True) == (1, 1, 8100)
     assert mb.combine_credit_policy(N=8, D=8) == (4, 4, 8100)
     assert mb.combine_credit_policy(N=8, D=2) == (1, 1, 8100)
     assert mb.combine_credit_policy(N=8, D=24) == (8, 8, 8100)
