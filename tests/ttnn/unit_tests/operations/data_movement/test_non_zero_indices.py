@@ -519,20 +519,26 @@ def test_nonzero_sharded_row_major_row_distinct_pattern(shape, grid_shape, shard
     run_nonzero_and_validate(torch_input, ttnn_input, device)
 
 
-@pytest.mark.parametrize("buffer_type", docstring_interleaved_buffer_type_params(ttnn.nonzero))
+@pytest.mark.parametrize("output_buffer_type", docstring_interleaved_buffer_type_params(ttnn.nonzero, label="Output"))
+@pytest.mark.parametrize("input_buffer_type", docstring_interleaved_buffer_type_params(ttnn.nonzero, label="Input"))
 @pytest.mark.parametrize("dtype, layout", docstring_dtype_layout_params(ttnn.nonzero))
-def test_nonzero_docstring_supported_inputs(dtype, layout, buffer_type, device):
-    """Runs every dtype, layout and interleaved buffer type the ttnn.nonzero docstring lists."""
+def test_nonzero_docstring_supported_inputs(dtype, layout, input_buffer_type, output_buffer_type, device):
+    """Runs every dtype, layout and interleaved input and output buffer type the ttnn.nonzero docstring lists."""
     x = torch_input((1, 2, 32, 64), dtype)
     x[x == 0] = 1
     x.view(-1)[::3] = 0
-    memory_config = interleaved_memory_config(buffer_type)
-    input_tensor = ttnn.from_torch(x, dtype=dtype, layout=layout, device=device, memory_config=memory_config)
-    count_tensor, indices_tensor = ttnn.nonzero(input_tensor, memory_config=memory_config)
+    input_tensor = ttnn.from_torch(
+        x, dtype=dtype, layout=layout, device=device, memory_config=interleaved_memory_config(input_buffer_type)
+    )
+    count_tensor, indices_tensor = ttnn.nonzero(
+        input_tensor, memory_config=interleaved_memory_config(output_buffer_type)
+    )
 
     for output in (count_tensor, indices_tensor):
-        assert output.memory_config().buffer_type == buffer_type
-    count = int(ttnn.to_torch(count_tensor)[0, 0, 0, 0].item())
-    indices = ttnn.to_torch(indices_tensor)[0, 0, 0, : count * 4].reshape(count, 4)
+        assert output.memory_config().buffer_type == output_buffer_type
     # torch.nonzero has no UINT32 kernel, so search a float64 copy.
-    assert_exact(torch.nonzero(ttnn.to_torch(input_tensor).to(torch.float64), as_tuple=False), indices)
+    expected = torch.nonzero(ttnn.to_torch(input_tensor).to(torch.float64), as_tuple=False)
+    count = int(ttnn.to_torch(count_tensor)[0, 0, 0, 0].item())
+    assert count == expected.shape[0]
+    indices = ttnn.to_torch(indices_tensor)[0, 0, 0, : count * 4].reshape(count, 4)
+    assert_exact(expected, indices)
