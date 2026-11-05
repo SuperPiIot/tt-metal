@@ -628,8 +628,10 @@ FlatProgramHandles add_flat_routed_expert_program(
         TT_FATAL(yrm_rows(pw) >= 1, "flat_routed_expert: row-major y: no room for one row tile");
         arena_cb(16, p.o_off, yrm_rows(pw) * pw * 2048, cores, tt::DataFormat::Float16_b, 2048);
     };
-    arena_cb(0, 0, kRmChunks * 32 * p.seg, p.relays, tt::DataFormat::Float16_b, p.seg);
-    arena_cb(1, p.sb_off, kSbSlots * MT * p.sbt * kBf8Tile, p.relays, bfp8, kBf8Tile);
+    // (the read / tilize CBs on the helper relays only: the primaries read nothing - their arena there is free)
+    const std::vector<CoreCoord> helper_relays(p.relays.begin() + NR, p.relays.end());
+    arena_cb(0, 0, kRmChunks * 32 * p.seg, helper_relays, tt::DataFormat::Float16_b, p.seg);
+    arena_cb(1, p.sb_off, kSbSlots * MT * p.sbt * kBf8Tile, helper_relays, bfp8, kBf8Tile);
     arena_cb(1, 0, p.ring_g * p.slot * w_tile, p.gu, wf, w_tile);
     arena_cb(0, p.x_off, p.x_slots * x_bytes, p.gu, bfp8, kBf8Tile);
     arena_cb(3, p.hl_off, p.hbuf * MT * p.hpc * kBf8Tile, p.gu, bfp8, kBf8Tile);
@@ -653,8 +655,10 @@ FlatProgramHandles add_flat_routed_expert_program(
         4 * dyn_half,
         p.meta_bytes,
         p.dyn_bytes);
-    arena_cb(6, p.meta_off, meta_bytes, arena_cores, tt::DataFormat::UInt32, meta_bytes);
-    arena_cb(7, p.dyn_off, 4 * dyn_half, arena_cores, tt::DataFormat::UInt32, 4 * dyn_half);
+    // (on the cells that run kernels: the idle / spare cells' arena is free - FlatRoutedExpertPlan::free_l1)
+    const auto work_cores = p.work_cores();
+    arena_cb(6, p.meta_off, meta_bytes, work_cores, tt::DataFormat::UInt32, meta_bytes);
+    arena_cb(7, p.dyn_off, 4 * dyn_half, work_cores, tt::DataFormat::UInt32, 4 * dyn_half);
 
     override_flat_routed_expert_addresses(program, sv, t);
     return sv;

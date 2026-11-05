@@ -144,8 +144,9 @@ CombineL1Plan plan_routed_experts_combine_l1(
     in.credit_batch = combine.credit_batch;
     in.arena_bytes = out.arena_bytes;
     if (!combine.landing || *combine.landing == CombineLanding::FlatCores) {  // (the flat cells' free tails)
-        in.flat_cells = fp->arena_cores();
-        in.flat_bytes = fp->arena_tiles * 2048;
+        for (auto& f : fp->free_l1(out.arena_bytes)) {
+            in.flat_free.push_back({std::move(f.cells), std::move(f.spans)});
+        }
     }
     out.plan = make_combine_plan(mesh, res, in);
     return out;
@@ -174,9 +175,15 @@ CombineState make_state(
     s.cells = l1.cells;
     s.handoff.writers = fre::flat_y_writers(*s.flat.plan);
     s.plan = l1.plan;
-    TT_FATAL(
-        !s.plan->flat_pool || fre::flat_routed_expert_plan(mesh, s.flat_config)->arena_tiles * 2048 <= s.plan->pool_off,
-        "routed_experts_combine: the flat expert's arena overlaps the landing slots on its cells");
+    {  // (the program's flat plan leaves the same L1 free as the one the pool was carved from)
+        const auto fo = fre::flat_routed_expert_plan(mesh, s.flat_config);
+        const auto& f0 = *fre::flat_routed_expert_plan(mesh, l1.flat);
+        TT_FATAL(
+            !s.plan->flat_pool ||
+                (fo->meta_off == f0.meta_off && fo->dyn_off == f0.dyn_off && fo->gu_bytes == f0.gu_bytes &&
+                 fo->land_off == f0.land_off && fo->relay_bytes == f0.relay_bytes && fo->arena_tiles == f0.arena_tiles),
+            "routed_experts_combine: the flat expert's arena differs from the one the landing pool was planned on");
+    }
     const uint32_t S = s.plan->S, W = s.plan->W;
 
     // the call's arena: every worker core, the combine's bytes then the writers' words (rows of 64 B)

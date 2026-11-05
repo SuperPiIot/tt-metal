@@ -18,9 +18,11 @@ accumulators).
   demand; reader (rings + local ring), fp32 accumulate compute, writer. Ports apart (per-chip roles: a chip's
   accumulators are the cells less its own ports, the senders find a home's accumulators in a DRAM LUT) or on the ports'
   cells (`acc_on_ports`), whichever `combine_auto` picks / the head planned (`CombineConfig.n_acc`, `.mode`).
-* **Landing rings on the flat cells** (`CombineLanding.FlatCores`, `REC_POOL`): the rings' slots in the flat cells'
-  arena past the flat plan's bytes (`pool_off`, the same offset on every flat cell) instead of the accumulator's L1,
-  which then keeps its fp32 sums, CBs and deeper local / injection rings. The accumulator probes its slots' trailers
+* **Landing rings on the flat cells** (`CombineLanding.FlatCores`, `REC_POOL`): the rings' slots in the arena the flat
+  expert leaves free on its cells (`FlatRoutedExpertPlan::free_l1`, per role: gate/up past its own bytes, the primary
+  relays below and past their landing rings, the helper relays from them, the idle / spare cells all of it, every cell
+  past CBs 6 / 7; `kernels/dataflow/combine_pool.hpp`) instead of the accumulator's L1, which then keeps its fp32 sums,
+  CBs and deeper local / injection rings. The accumulator probes its slots' trailers
   (32 B reads, several slots a source at once), reads landed rows over the NoC (`kPoolRows` in flight) and clears a
   taken slot's trailer before its credit goes back. With no `CombineConfig.landing` the planner plans both and keeps
   the deeper rings (then the larger injection ring, then local ring). A port sends any row of the first 32 of its

@@ -94,6 +94,19 @@ struct FlatRoutedExpertPlan {
     std::vector<uint32_t> d_heads;
 
     std::vector<Core> arena_cores() const;  // gu + down + relays + gu_idle + spare
+    // The arena a call leaves free on the flat cells, up to arena_end (the caller's arena bytes a core): cells with the
+    // same free spans ([begin, end) offsets, 64 B aligned) - what the combine lands rows in
+    // (CombineLanding::FlatCores). Gate/up: past its own bytes up to CBs 6 / 7; primary relays: below their landing
+    // rings (they read / tilize nothing) and past them; helper relays: from the landing rings' offset (they only send);
+    // idle / spare cells: all of it (no kernel there, no CB bound); every arena core: past CBs 6 / 7. Down cores: past
+    // CBs 6 / 7 (their out CB takes the room up to them).
+    struct FreeL1 {
+        std::vector<Core> cells;
+        std::vector<std::pair<uint32_t, uint32_t>> spans;
+    };
+    std::vector<FreeL1> free_l1(uint32_t arena_end) const;
+    // the cells that run kernels / bind CBs 6 / 7 (gate/up, down, relays)
+    std::vector<Core> work_cores() const;
     uint32_t rect_of(const Core& c) const;
     static uint32_t kd_of(uint32_t pcd, uint32_t it);
 };

@@ -167,9 +167,40 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
         }
     }
     // (FlatCores: the flat cells' free arena tails, whole slots a cell)
-    const uint32_t pool_off = align64(in.flat_bytes);
-    const uint32_t pool_spc = in.arena_bytes > pool_off ? (in.arena_bytes - pool_off) / plan->pc.slot : 0u;
-    const uint32_t pool_slots = pool_spc * static_cast<uint32_t>(in.flat_cells.size());
+    // (the pool: every free span's whole slots, classes of cells with the same spans -
+    // kernels/dataflow/combine_pool.hpp)
+    uint32_t pool_slots = 0;
+    std::vector<uint32_t> pool_args = {0, 0};
+    for (const auto& fc : in.flat_free) {
+        std::vector<uint32_t> spans;
+        uint32_t spc = 0;
+        for (const auto& [b, e] : fc.spans) {
+            const uint32_t n = std::min<uint32_t>((e - b) / plan->pc.slot, 0xFFFF);
+            if (n > 0) {
+                TT_FATAL(b % 64 == 0 && b / 64 <= 0xFFFF, "routed_experts_combine: pool span at {}", b);
+                spans.push_back(b / 64 | n << 16);
+                spc += n;
+            }
+        }
+        if (spans.empty() || fc.cells.empty()) {
+            continue;
+        }
+        TT_FATAL(fc.cells.size() < 256 && spans.size() < 256 && spc <= 0xFFFF, "routed_experts_combine: pool class");
+        pool_args.push_back(static_cast<uint32_t>(fc.cells.size()) | spans.size() << 8 | spc << 16);
+        pool_args.insert(pool_args.end(), spans.begin(), spans.end());
+        for (size_t c = 0; c < fc.cells.size(); c += 2) {
+            uint32_t w = 0;
+            for (size_t k = c; k < std::min(c + 2, fc.cells.size()); ++k) {
+                const auto v = mesh_device.worker_core_from_logical_core(fc.cells[k]);
+                TT_FATAL(v.x < 256 && v.y < 256, "routed_experts_combine: pool cell {}", v);
+                w |= (static_cast<uint32_t>(v.x) | static_cast<uint32_t>(v.y) << 8) << ((k - c) * 16);
+            }
+            pool_args.push_back(w);
+        }
+        pool_slots += static_cast<uint32_t>(fc.cells.size()) * spc;
+        ++pool_args[1];
+    }
+    pool_args[0] = static_cast<uint32_t>(pool_args.size());
     auto plan_with = [&](CombineLanding l) {
         return combine_auto(
             N,
@@ -202,8 +233,7 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     const bool flat_pool = landing == CombineLanding::FlatCores;
     TT_FATAL(
         !flat_pool || pool_slots > 0,
-        "routed_experts_combine: FlatCores landing - no free slot on the flat cells ({} KB of {} KB)",
-        in.flat_bytes >> 10,
+        "routed_experts_combine: FlatCores landing - no free slot on the flat cells (arena {} KB)",
         in.arena_bytes >> 10);
     TT_FATAL(
         au.fits,
@@ -319,12 +349,8 @@ std::shared_ptr<const CombinePlan> make_combine_plan(
     const uint32_t acc_area = plan->st.RINGS + (flat_pool ? 0u : plan->PSL * SLOT);
     if (flat_pool) {  // (every flat cell, in the flat plan's order)
         plan->flat_pool = true;
-        plan->pool_off = pool_off;
-        plan->pool_spc = pool_spc;
-        for (uint32_t i = 0; i < in.flat_cells.size(); ++i) {
-            const auto v = mesh_device.worker_core_from_logical_core(in.flat_cells.at(i));
-            plan->pool_xy.push_back(static_cast<uint32_t>(v.x) | static_cast<uint32_t>(v.y) << 8);
-        }
+        plan->pool_slots = pool_slots;
+        plan->pool_args = std::move(pool_args);
     }
     uint32_t QP = QP0, QL = 0;
     if (plan->fused) {  // (local ring up to 16 slots, then the injection ring up to QP, from what is left)
@@ -583,8 +609,6 @@ CombineHandles add_combine_program(
         auto pool_defs = [&](std::map<std::string, std::string>& d) {  // (FlatCores: the rings on the flat cells)
             if (plan.flat_pool) {
                 d["REC_POOL"] = "1";
-                d["REC_POOL_OFF"] = std::to_string(plan.pool_off);
-                d["REC_POOL_SPC"] = std::to_string(plan.pool_spc);
             }
         };
         pool_defs(defs);
@@ -617,8 +641,7 @@ CombineHandles add_combine_program(
                 a.lits(acc_xy);
             }
             if (plan.flat_pool) {
-                a.lit(static_cast<uint32_t>(plan.pool_xy.size()));
-                a.lits(plan.pool_xy);
+                a.lits(plan.pool_args);
             }
             for (uint32_t i = 0; i < N; ++i) {  // per source chip: the port on it that feeds me on my link
                 const auto s = topo.coord(i);
@@ -705,8 +728,6 @@ CombineHandles add_combine_program(
         }
         if (plan.flat_pool) {
             rd_defs["REC_POOL"] = "1";
-            rd_defs["REC_POOL_OFF"] = std::to_string(plan.pool_off);
-            rd_defs["REC_POOL_SPC"] = std::to_string(plan.pool_spc);
             rd_defs["REC_POOL_ROWS"] = std::to_string(plan.row_depth);
         }
         accessor(rd_ct, rd_defs, "CMB_PLAN_CT", CombineBuf::Plan);
@@ -755,8 +776,7 @@ CombineHandles add_combine_program(
                 }
             }
             if (plan.flat_pool) {
-                a.lit(static_cast<uint32_t>(plan.pool_xy.size()));
-                a.lits(plan.pool_xy);
+                a.lits(plan.pool_args);
             }
             a.lits({i == 0 ? 1u : 0u, nz, i == 0 ? static_cast<uint32_t>(comb.size()) : 0u});  // (the gate)
             if (i == 0) {

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
 #include "combine_zero_gate.hpp"
+#include "combine_pool.hpp"
 #include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 
 constexpr uint32_t cb_row = get_compile_time_arg_val(0);
@@ -46,14 +47,14 @@ constexpr uint32_t SHARED = 0, G = 1, GIDH = 0;
 #endif
 #define GTAG(q) (0x80u | ((q) & 0x7Fu))  // (a grant's tag: never 0 - a zeroed ring entry is no grant)
 // REC_POOL (CombineLanding::FlatCores): the rings' slots on the flat cells - ring slot i is pool slot g = me x PSL + i,
-// at the pool cell g / SPC (runtime args: count, then x | y << 8 each), arena offset POOL_OFF + (g % SPC) x SLOT. A
+// of the flat cells' free arena (combine_pool.hpp; its args after the ports' x, y). A
 // row landed once its trailer reads so (32 B reads, several slots a source at once); taking it clears the trailer there
 // before the credit goes back (trailers zeroed each call).
 #ifdef REC_POOL
-constexpr uint32_t POOL = 1, POOL_OFF = REC_POOL_OFF, SPC = REC_POOL_SPC, PROWS = REC_POOL_ROWS;
+constexpr uint32_t POOL = 1, PROWS = REC_POOL_ROWS;
 static_assert(!SHARED, "the shared landing: in the accumulators' L1 only");
 #else
-constexpr uint32_t POOL = 0, POOL_OFF = 0, SPC = 1, PROWS = 2;
+constexpr uint32_t POOL = 0, PROWS = 2;
 #endif
 
 void kernel_main() {
@@ -68,11 +69,9 @@ void kernel_main() {
     // are set)
     const uint32_t call = rec::next_call(bar, BAR_SLOT);
     rec::zero_l1(area, RINGS);
-    const uint32_t pool_a = 7 + 2 * N + 1;  // (REC_POOL: the pool cells' args, after the ports' x, y and their count)
+    const uint32_t pool_a = 7 + 2 * N;             // (REC_POOL: the pool's args, after the ports' x, y)
     auto pool_noc = [&](uint32_t i) -> uint64_t {  // my ring slot i's NoC address on its flat cell
-        const uint32_t g = me * PSL + i;
-        const uint32_t xy = get_arg_val<uint32_t>(pool_a + g / SPC);
-        return get_noc_addr(xy & 0xFF, xy >> 8, area + POOL_OFF + (g % SPC) * SLOT);
+        return rec_pool_noc(pool_a, area, SLOT, me * PSL + i);
     };
     if constexpr (POOL) {  // (no row in any of my slots: their trailers zeroed, from the zeroed state's first words)
         for (uint32_t i = 0; i < PSL; ++i) {
@@ -89,7 +88,7 @@ void kernel_main() {
         py[k] = get_arg_val<uint32_t>(a++);
     }
     if constexpr (POOL) {
-        a += 1 + get_arg_val<uint32_t>(a);
+        a += get_arg_val<uint32_t>(a);
     }
     {
         const uint32_t is_gate = get_arg_val<uint32_t>(a++), nz = get_arg_val<uint32_t>(a++);

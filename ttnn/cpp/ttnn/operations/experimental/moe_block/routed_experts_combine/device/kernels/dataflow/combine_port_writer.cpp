@@ -16,6 +16,7 @@
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_worker_adapters.hpp"
 #include "tt_metal/fabric/hw/inc/tt_fabric_api.h"
 #include "combine_zero_gate.hpp"
+#include "combine_pool.hpp"
 #include "ttnn/cpp/ttnn/operations/experimental/moe_block/common/combine_plan_words.hpp"
 using namespace tt::tt_fabric;
 
@@ -67,13 +68,12 @@ constexpr uint32_t SHARED = 0, G = 1, GIDH = 0, GREC = 0;
 #endif
 constexpr uint32_t SNAPW = SHARED ? AP * (1 + G) : AP;  // (a snapshot's words)
 #define GTAG(q) (0x80u | ((q) & 0x7Fu))                // (a grant's tag: never 0 - a zeroed entry is no grant)
-// REC_POOL (CombineLanding::FlatCores): a home's accumulator o's ring slot i is on the flat cells - pool slot
-// g = o x PSL + i, at the pool cell g / SPC (runtime args: count, then x | y << 8 each; the same cells on every chip),
-// arena offset POOL_OFF + (g % SPC) x SLOT
+// REC_POOL (CombineLanding::FlatCores): a home's accumulator o's ring slot i is pool slot g = o x PSL + i of the flat
+// cells' free arena (combine_pool.hpp; its args after the accumulators' - the same cells on every chip)
 #ifdef REC_POOL
-constexpr uint32_t POOL = 1, POOL_OFF = REC_POOL_OFF, SPC = REC_POOL_SPC;
+constexpr uint32_t POOL = 1;
 #else
-constexpr uint32_t POOL = 0, POOL_OFF = 0, SPC = 1;
+constexpr uint32_t POOL = 0;
 #endif
 #ifdef REC_FUSED
 constexpr uint32_t cb_out = get_compile_time_arg_val(29);
@@ -127,9 +127,9 @@ void kernel_main() {
 #define ACC_X(h, o) ax[o]
 #define ACC_Y(h, o) ay[o]
 #endif
-    const uint32_t pool_a = a + 1;
+    const uint32_t pool_a = a;
     if constexpr (POOL) {
-        a += 1 + get_arg_val<uint32_t>(a);
+        a += get_arg_val<uint32_t>(a);
     }
     // per source chip s: the port on s that feeds my chip on my link (where s's credits go); 0 if not mine to return
     uint32_t sx[N], sy[N];
@@ -444,8 +444,7 @@ void kernel_main() {
         }
         uint64_t dn;
         if constexpr (POOL) {
-            const uint32_t g = o * PSL + dst, xy = get_arg_val<uint32_t>(pool_a + g / SPC);
-            dn = get_noc_addr(xy & 0xFF, xy >> 8, area + POOL_OFF + (g % SPC) * SLOT);
+            dn = rec_pool_noc(pool_a, area, SLOT, o * PSL + dst);
         } else {
             dn = get_noc_addr(ACC_X(home, o), ACC_Y(home, o), SHARED ? dst : area + RINGS + dst * SLOT);
         }

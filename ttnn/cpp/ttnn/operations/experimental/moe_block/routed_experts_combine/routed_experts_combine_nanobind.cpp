@@ -230,6 +230,7 @@ void bind_routed_experts_combine(nb::module_& mod) {
             d["shared"] = l1.plan->shared;
             d["PSL"] = l1.plan->PSL;
             d["flat_pool"] = l1.plan->flat_pool;
+            d["pool_slots"] = l1.plan->pool_slots;
             return d;
         },
         nb::arg("resources"),

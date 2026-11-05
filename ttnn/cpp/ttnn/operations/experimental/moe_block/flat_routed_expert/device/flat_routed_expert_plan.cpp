@@ -132,6 +132,44 @@ std::vector<Core> FlatRoutedExpertPlan::arena_cores() const {
     return out;
 }
 
+std::vector<Core> FlatRoutedExpertPlan::work_cores() const {
+    std::vector<Core> out = gu;
+    for (const auto* l : {&down, &relays}) {
+        out.insert(out.end(), l->begin(), l->end());
+    }
+    return out;
+}
+
+std::vector<FlatRoutedExpertPlan::FreeL1> FlatRoutedExpertPlan::free_l1(uint32_t arena_end) const {
+    auto a64 = [](uint32_t x) { return (x + 63u) & ~63u; };
+    const uint32_t tail = a64(dyn_off + dyn_bytes);
+    std::vector<FreeL1> out;
+    auto add = [&](std::vector<Core> cells, std::vector<std::pair<uint32_t, uint32_t>> spans) {
+        std::vector<std::pair<uint32_t, uint32_t>> ok;
+        for (auto [b, e] : spans) {
+            b = a64(b);
+            if (e > b) {
+                ok.emplace_back(b, e);
+            }
+        }
+        if (!cells.empty() && !ok.empty()) {
+            out.push_back({std::move(cells), std::move(ok)});
+        }
+    };
+    const uint32_t nr = static_cast<uint32_t>(rects.size());  // (relays 0 .. nr - 1: the primaries, then helpers)
+    add(gu, {{gu_bytes, meta_off}, {tail, arena_end}});
+    add(down, {{tail, arena_end}});
+    add(std::vector<Core>(relays.begin(), relays.begin() + std::min<size_t>(nr, relays.size())),
+        {{0, land_off}, {relay_bytes, meta_off}, {tail, arena_end}});
+    if (relays.size() > nr) {
+        add(std::vector<Core>(relays.begin() + nr, relays.end()), {{land_off, meta_off}, {tail, arena_end}});
+    }
+    std::vector<Core> idle = gu_idle;
+    idle.push_back(spare);
+    add(idle, {{0, arena_end}});
+    return out;
+}
+
 tt::tt_metal::CoreRangeSet rect_ranges(const std::vector<Core>& cores) {
     std::set<std::pair<uint32_t, uint32_t>> left;
     for (const auto& c : cores) {
